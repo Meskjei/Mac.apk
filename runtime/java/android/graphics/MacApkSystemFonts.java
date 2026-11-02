@@ -63,6 +63,23 @@ public final class MacApkSystemFonts {
 
     /** A staging directory older than this cannot belong to a live writer. */
     private static final long STALE_PART_MS = 60L * 60L * 1000L;
+    private static final String EMOJI_FONT = "NotoColorEmoji.ttf";
+    private static volatile File published;
+
+    /** Configuration evidence only: glyph rasterization is verified separately. */
+    public static String fontSetId() { return published == null ? "" : published.getName(); }
+    public static boolean nativeEmojiConfigured() {
+        File dir = published;
+        return dir != null && new File(dir, EMOJI_FONT).isFile();
+    }
+
+    private static String nativeFontsXml(String xml) {
+        // Native Skia/FreeType supports CBDT; AWT's zero-width bitmap path must
+        // not load this face through MacApkFontFamilies' Java fallback list.
+        return xml.replace("</familyset>", "    <family lang=\"und-Zsye\">\n"
+            + "        <font weight=\"400\" style=\"normal\">" + EMOJI_FONT + "</font>\n"
+            + "    </family>\n</familyset>");
+    }
 
     /** The published directory (fonts.xml plus every face it names), writing
      *  it on first use; null when disabled or when it cannot be built, in which
@@ -80,8 +97,9 @@ public final class MacApkSystemFonts {
         if (!ENABLED) return null;
         try {
             List<MacApkHostFonts.Family> host = MacApkHostFonts.resolve(hostFontFile);
-            String baseXml = MacApkFontFamilies.systemFontsXml();
+            String baseXml = nativeFontsXml(MacApkFontFamilies.systemFontsXml());
             List<String> files = MacApkFontFamilies.systemFontFiles();
+            files.add(EMOJI_FONT);
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             md.update(baseXml.getBytes(StandardCharsets.UTF_8));
             md.update(MacApkHostFonts.identity(host).getBytes(StandardCharsets.UTF_8));
@@ -94,7 +112,7 @@ public final class MacApkSystemFonts {
 
             File root = root();
             File dir = new File(root, key);
-            if (new File(dir, "fonts.xml").isFile()) return dir.getPath();
+            if (new File(dir, "fonts.xml").isFile()) { published = dir; return dir.getPath(); }
 
             purgeStaleParts(root);
             File part = new File(root, key + ".part-" + ProcessHandle.current().pid());
@@ -118,7 +136,7 @@ public final class MacApkSystemFonts {
                     }
                 }
             }
-            String xml = host.isEmpty() ? baseXml : MacApkFontFamilies.systemFontsXml(host);
+            String xml = host.isEmpty() ? baseXml : nativeFontsXml(MacApkFontFamilies.systemFontsXml(host));
             writeForced(new File(part, "fonts.xml").toPath(), xml.getBytes(StandardCharsets.UTF_8));
             try {
                 Files.move(part.toPath(), dir.toPath(), StandardCopyOption.ATOMIC_MOVE);
@@ -126,7 +144,9 @@ public final class MacApkSystemFonts {
                 // Another runtime published the same key first; its copy is identical.
                 deleteTree(part.toPath());
             }
-            return new File(dir, "fonts.xml").isFile() ? dir.getPath() : null;
+            if (!new File(dir, "fonts.xml").isFile()) return null;
+            published = dir;
+            return dir.getPath();
         } catch (Throwable t) {
             System.err.println("[W] MacApkSystemFonts: /system/fonts not published: " + t);
             return null;

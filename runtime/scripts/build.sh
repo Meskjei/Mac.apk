@@ -132,6 +132,12 @@ if compgen -G "$RT_DIR/fonts/*.ttf" > /dev/null; then
         cp -f "$_f" "$TMP/fonts/$(basename "$_f")"
     done
     ( cd "$TMP" && "$JAR" --update --file "$LIB/android-framework.jar" fonts )
+    # Keep the redistributed colour font's OFL with the installed resource.
+    for _f in "$RT_DIR"/fonts/*.LICENSE; do
+        [ -f "$_f" ] || continue
+        cp -f "$_f" "$TMP/fonts/$(basename "$_f")"
+        ( cd "$TMP" && "$JAR" --update --file "$LIB/android-framework.jar" "fonts/$(basename "$_f")" )
+    done
     echo "[build] bundled $(ls -1 "$RT_DIR"/fonts/*.ttf | wc -l | tr -d ' ') font(s) into android-framework.jar"
 fi
 
