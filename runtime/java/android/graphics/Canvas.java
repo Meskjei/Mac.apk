@@ -2657,14 +2657,12 @@ public class Canvas {
         while (i < n) {
             // Mirror of Paint.macapkMeasureRuns: an emoji cluster advances the
             // pen by the measured emoji advance, so the glyphs AFTER it land
-            // where measureText said they would. The cluster itself is still
-            // painted by the JDK composite (we rasterize no colour font), so it
-            // may sit narrow inside its box -- a far smaller defect than every
-            // emoji-bearing string wrapping at the wrong point.
+            // where measureText said they would. Paint colour-font bitmaps
+            // directly; AWT can shape this face but cannot rasterize its CBDT.
             int ee = MacApkFont.emojiClusterEnd(text, i, n);
             if (ee > i) {
                 String ec = text.substring(i, ee);
-                g.drawString(ec, cx, y);
+                if (!MacApkEmoji.draw(g, ec, cx, y, sizePx)) g.drawString(ec, cx, y);
                 cx += MacApkFont.emojiAdvance(sizePx);
                 i = ee;
                 continue;

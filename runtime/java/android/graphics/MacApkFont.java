@@ -747,8 +747,13 @@ public final class MacApkFont {
     public static int emojiClusterEnd(String text, int i, int n) {
         if (text == null || i < 0 || i >= n) return -1;
         int cp = text.codePointAt(i);
-        // Cheap reject before any reflection: nothing below U+203C is emoji.
-        if (cp < 0x203C) return -1;
+        // ASCII is text unless it forms a keycap sequence.
+        if (cp < 0x203C) {
+            if (cp != '#' && cp != '*' && (cp < '0' || cp > '9')) return -1;
+            int keycap = i + 1;
+            if (keycap < n && text.charAt(keycap) == 0xFE0F) keycap++;
+            return keycap < n && text.charAt(keycap) == 0x20E3 ? keycap + 1 : -1;
+        }
         int j = i + Character.charCount(cp);
         if (!isEmojiPresentation(cp)) {
             // Text-default (c)/(tm)/heart style: emoji ONLY with a following VS16.
@@ -784,7 +789,7 @@ public final class MacApkFont {
         if (text == null) return false;
         for (int i = 0; i < text.length(); ) {
             int cp = text.codePointAt(i);
-            if (cp >= 0x203C && (isEmojiPresentation(cp) || isEmojiCodepoint(cp))) return true;
+            if (cp < 0x203C ? emojiClusterEnd(text, i, text.length()) > i : (isEmojiPresentation(cp) || isEmojiCodepoint(cp))) return true;
             i += Character.charCount(cp);
         }
         return false;
@@ -1084,15 +1089,11 @@ public final class MacApkFont {
         "/fonts/NotoSansHebrew-Bold.ttf",
     };
 
-    // ⚠ NotoColorEmoji.ttf is deliberately NOT bundled. It LOADS under
-    // Font.createFont and canDisplayUpTo even answers true, so it looks
-    // available -- but it is a CBDT/CBLC colour-bitmap font and AWT gives every
-    // glyph in it a **0.000 advance** (measured on the AVD's own 9.7 MB copy at
-    // 32px). Bundling it would make emoji measure zero-wide and paint nothing,
-    // where the JDK logical composite currently renders real colour emoji off
-    // macOS at a wrong-but-nonzero advance. That is why the 8 emoji rows in
-    // TXTM stay open: closing them needs a colour-font-capable draw path, not
-    // a font file. Do not "just bundle it".
+    // NotoColorEmoji is bundled for the native font manager and MacApkEmoji's
+    // CBDT PNG painter, but MUST stay out of this AWT fallback list: AWT can
+    // shape its glyph IDs while reporting zero advances and drawing nothing.
+    // Paint owns Android advances; MacApkEmoji paints colour without using
+    // AWT's unsupported colour-glyph measurement/rasterization.
 
     /** True when this bundled fallback is the BOLD cut of its family, matched by
      *  the AOSP file-naming convention its own fonts.xml uses. */
