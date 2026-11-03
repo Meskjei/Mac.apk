@@ -101,6 +101,7 @@ public class JSONObject {
 
     public int    length() { return map.size(); }
     public Iterator<String> keys() { return map.keySet().iterator(); }
+    public java.util.Set<String> keySet() { return map.keySet(); }
     /** AOSP: throws whenever the stored value is null. put(String,Object)
      *  never stores a raw null (a null value REMOVES the key, matching
      *  AOSP), so in practice this fires exactly when the key is absent. */

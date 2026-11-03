@@ -6,5 +6,5 @@ import android.graphics.Canvas;
  *  Source: frameworks/base (historical) android.view.HardwareCanvas */
 public abstract class HardwareCanvas extends Canvas {
     public HardwareCanvas() { super(); }
-    @Override public boolean isHardwareAccelerated() { return true; }
+    @Override public boolean isHardwareAccelerated() { return super.isHardwareAccelerated(); }
 }

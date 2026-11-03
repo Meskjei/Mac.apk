@@ -689,7 +689,16 @@ public final class SpecialAccessStore {
 
     /** The stored per-app grant for a location permission: is it granted? */
     public static boolean locationGranted(String perm) {
-        String st = snapshot().perms.get(perm);
+        return locationGranted(perm, snapshot().perms);
+    }
+
+    static boolean locationGranted(String perm, java.util.Map<String, String> states) {
+        String st = states.get(perm);
+        // Older fine-only prompts did not write a coarse entry. Precise access
+        // includes approximate access; retain an explicit coarse denial.
+        if (st == null && PERM_ACCESS_COARSE_LOCATION.equals(perm)) {
+            st = states.get(PERM_ACCESS_FINE_LOCATION);
+        }
         return ST_GRANTED.equals(st) || ST_GRANTED_FIXED.equals(st);
     }
 

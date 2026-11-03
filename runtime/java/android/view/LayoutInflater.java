@@ -907,7 +907,8 @@ public class LayoutInflater {
             && inflated.getParent() == null) {
             root.addView(inflated);
         }
-        return inflated;
+        // Android returns the supplied container when the inflated view is attached.
+        return root != null && attachToRoot ? root : inflated;
     }
 
     /** Walk the DOM tree starting at `elem`, instantiating each tag

@@ -70,6 +70,12 @@
 // refreshed the store. Judge "what does the user see" on `composite`; keep
 // using the per-layer sources to attribute WHICH surface carries content.
 //
+// AUTOMATION CURRENT-FRAME REQUESTS. A request containing exactly
+// "composite-current-v1" reads all visible Metal layers from retained drawables
+// confirmed by addPresentedHandler, then builds only the composite. Incomplete
+// layers fall back to the legacy window; empty diagnostic requests still collect
+// every source. This avoids waiting for a new frame on an already rendered page.
+//
 // IDLE APPS (v1.0.835). The capture used to piggyback strictly on the NEXT
 // present, so a static menu that never repaints produced nothing and the caller
 // timed out. Frozen Bubble proved it: `canvas 76549` on one run and NO source at

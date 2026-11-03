@@ -56,6 +56,20 @@ namespace osnative {
 
 namespace {
 
+jint NativeOs_chmod(JNIEnv* env, jclass, jstring path, jint mode) {
+    const char* utf = env->GetStringUTFChars(path, nullptr);
+    if (!utf) return -12; // ENOMEM; JVM exception remains pending.
+    int result = ::chmod(utf, (mode_t)(mode & 07777));
+    int error = errno;
+    env->ReleaseStringUTFChars(path, utf);
+    if (result == 0) return 0;
+    // chmod's other POSIX errors have identical Darwin/Bionic values.
+    if (error == ELOOP) return -40;
+    if (error == ENAMETOOLONG) return -36;
+    if (error == ENOTSUP) return -95;
+    return -error;
+}
+
 jlong NativeOs_lseek(JNIEnv*, jclass, jint fd, jlong offset, jint whence) {
     off_t r = ::lseek((int)fd, (off_t)offset, (int)whence);
     return (r == (off_t)-1) ? (jlong)(-errno) : (jlong)r;
@@ -468,6 +482,7 @@ jbyteArray NativeOs_xzDecompress(JNIEnv* env, jclass, jbyteArray in) {
 }
 
 const JNINativeMethod kNativeOsMethods[] = {
+    {(char*)"chmod",       (char*)"(Ljava/lang/String;I)I",  (void*)NativeOs_chmod},
     {(char*)"xzDecompress", (char*)"([B)[B",          (void*)NativeOs_xzDecompress},
     {(char*)"open",        (char*)"(Ljava/lang/String;II)I", (void*)NativeOs_open},
     {(char*)"lseek",       (char*)"(IJI)J",                 (void*)NativeOs_lseek},

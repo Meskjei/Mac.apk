@@ -28,6 +28,8 @@
 #include <cstdlib>
 #include <cstring>
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
+#include "guest_data_pages.h"
+#include "../../include/macapk/egl_extensions.h"
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
 #include <cmath>             // std::fabs, std::isnan, std::isinf
@@ -39,6 +41,7 @@
 #include <cwchar>           // wcscoll/wcsxfrm (wcscoll_l/wcsxfrm_l's non-"_l" fallback)
 #include <strings.h>        // strcasecmp/strncasecmp (POSIX <strings.h>, NOT <string.h>)
 #include <sys/time.h>       // gettimeofday
+#include <sys/times.h>
 #include <sys/event.h>      // kqueue/kevent -- backs the Bionic epoll_* shims
 #include <mach/mach_time.h> // mach_absolute_time for CNTVCT_EL0 emulation
 #include <mach/thread_switch.h> // thread_switch/SWITCH_OPTION_DEPRESS for faithful sched_yield
@@ -64,6 +67,7 @@
 #include <dispatch/dispatch.h>  // libdispatch timers back the timerfd_* shims
 #include <utility>          // std::index_sequence
 #include <vector>
+#include "shared_memory_regions.h"
 
 #include <setjmp.h>        // sigsetjmp / siglongjmp for SEGV recovery
 #include <signal.h>        // sigaction
@@ -14100,6 +14104,14 @@ chain:
             t_ill_same_count = 1;
         }
         const bool looping = (t_ill_same_count >= kMaxSamePcTraps);
+        auto note_progress = [&] {
+            // A later valid deopt can revisit this same site. Count only
+            // consecutive returns that left the faulting instruction in place.
+            if (uc->uc_mcontext->__ss.__pc != pc_log) {
+                t_ill_last_pc = 0;
+                t_ill_same_count = 0;
+            }
+        };
 
         // Chain to the saved prior SIGILL handler (HotSpot's, captured
         // post-JVM-init) unless we are looping on this PC. Mirrors the
@@ -14110,7 +14122,10 @@ chain:
             // guest code then reaches a recorded guest action (OpenSSL's
             // OPENSSL_cpuid_setup probe handler, which siglongjmps out) instead
             // of HotSpot's fatal-error path.
-            if (__macapk_sigchain_deliver(sig, info, ucontext)) return;
+            if (__macapk_sigchain_deliver(sig, info, ucontext)) {
+                note_progress();
+                return;
+            }
             const struct sigaction& prev = g_old_ill_sa;
             if (prev.sa_flags & SA_SIGINFO) {
                 if (prev.sa_sigaction) {
@@ -14122,6 +14137,7 @@ chain:
                         (void*)prev.sa_sigaction, t_ill_same_count);
                     std::fflush(stderr);
                     prev.sa_sigaction(sig, info, ucontext);
+                    note_progress();
                     return;
                 }
             } else if (prev.sa_handler == SIG_IGN) {
@@ -14136,6 +14152,7 @@ chain:
                     (void*)pc_log, insn_log, t_ill_same_count);
                 std::fflush(stderr);
                 prev.sa_handler(sig);
+                note_progress();
                 return;
             }
         }
@@ -26694,7 +26711,7 @@ extern "C" ssize_t __macapk_arm64_readv(int fd, const struct iovec* iov, int cnt
 }
 
 extern "C" ssize_t __macapk_arm64_writev(int fd, const struct iovec* iov, int cnt) {
-    ssize_t rc = ::writev(fd, iov, cnt);
+    ssize_t rc = macapk_shared_memory::writev(fd, iov, cnt);
     int e = errno;
     if (net_trace_on() && g_net_trace_n.fetch_add(1) < net_trace_cap()) {
         int st = 0; socklen_t sl = sizeof st;
@@ -32964,6 +32981,7 @@ static std::shared_ptr<MacapkEventfd> macapk_efd_lookup(int fd) {
 // eventfd_ctx), so it shares the counter too.
 static void macapk_efd_dup(int oldfd, int newfd) {
     if (newfd < 0) return;
+    macapk_shared_memory::alias(oldfd, newfd);
     if (auto st = macapk_efd_lookup(oldfd)) macapk_efd_register(newfd, std::move(st));
 }
 // Carrier reconciliation (review issue 2 of
@@ -33150,7 +33168,7 @@ static ssize_t macapk_read_host(int fd, void* buf, size_t n) {
 }
 static ssize_t macapk_write_host(int fd, const void* buf, size_t n) {
     if (auto st = macapk_efd_lookup(fd)) return macapk_efd_write_host(fd, *st, buf, n);
-    return ::write(fd, buf, n);
+    return macapk_shared_memory::write(fd, n, -1, [&] { return ::write(fd, buf, n); });
 }
 
 extern "C" int __macapk_arm64_eventfd(unsigned int initval, int flags) {
@@ -33348,7 +33366,8 @@ extern "C" ssize_t __macapk_arm64_pread(int fd, void* buf, size_t count, off_t o
     return macapk_rw_face(::pread(fd, buf, count, offset));
 }
 extern "C" ssize_t __macapk_arm64_pwrite(int fd, const void* buf, size_t count, off_t offset) {
-    return macapk_rw_face(::pwrite(fd, buf, count, offset));
+    return macapk_rw_face(macapk_shared_memory::write(fd, count, offset,
+        [&] { return ::pwrite(fd, buf, count, offset); }));
 }
 
 // ATrace (android/trace.h): systrace markers. No tracing backend on macOS;
@@ -33443,6 +33462,8 @@ extern "C" void* __macapk_arm64_mremap(void* old_address, size_t old_size,
         return MAP_FAILED;
     }
     if (new_size == old_size) return old_address;
+    // A remap may release/reuse this reservation outside the mmap wrapper.
+    macapk_guest_pages::forget(old_address, old_size, (size_t)sysconf(_SC_PAGESIZE));
     if (new_size < old_size) {
         // Shrink in place: release the tail. munmap of a sub-range is legal
         // on macOS as long as it's page-aligned; round the boundary up.
@@ -36128,6 +36149,16 @@ static inline bool macapk_is_unity_window(void* w) {
         && g_macapk_unity_window.magic == kMacApkNWMagic;
 }
 
+// TextureView surfaces own separate streams; they must not alias the full-window layer.
+struct MacApkStreamWindow { jobject surface; unsigned references; int width, height; };
+static std::mutex g_stream_windows_mu;
+static std::unordered_map<void*, std::unique_ptr<MacApkStreamWindow>> g_stream_windows;
+static bool macapk_stream_window_create(void* dpy, void* config, void* window,
+                                        const int32_t* attribs, void** result);
+extern "C" unsigned __macapk_arm64_eglDestroySurface(void* dpy, void* surface);
+extern "C" unsigned __macapk_arm64_eglSwapBuffersWithDamageKHR(
+    void* dpy, void* surface, const int32_t* rects, int32_t count);
+
 // v1.0.162: Surface->CAMetalLayer bridge for Unity's eglCreateWindowSurface.
 // Unity passes the ANativeWindow* it got from ANativeWindow_fromSurface as
 // the EGLNativeWindowType. ANGLE's Metal backend expects a CAMetalLayer
@@ -36166,6 +36197,9 @@ void* g_unity_egl_surface = nullptr;
 
 extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
         void* dpy, void* config, void* win, const int32_t* attribs) {
+    void* stream_surface = nullptr;
+    if (macapk_stream_window_create(dpy, config, win, attribs, &stream_surface))
+        return stream_surface;
     void* native = nullptr;
     if (win) {
         MacApkNativeWindow* mnw = reinterpret_cast<MacApkNativeWindow*>(win);
@@ -37775,8 +37809,16 @@ extern "C" unsigned __macapk_arm64_eglMakeCurrent(void* dpy, void* draw,
         reinterpret_cast<McFn>(dlsym(RTLD_DEFAULT, "eglMakeCurrent"));
     // A Java EGL14 window's handle names the pbuffer behind it now (GitHub #16;
     // see macapk_egl14_window_resolve), as EGL14_eglMakeCurrent translates it.
-    return real ? real(dpy, macapk_egl14_window_resolve(dpy, draw),
-                       macapk_egl14_window_resolve(dpy, read), ctx) : 0;
+    void* resolved_draw = macapk_egl14_window_resolve(dpy, draw);
+    void* resolved_read = macapk_egl14_window_resolve(dpy, read);
+    unsigned result = real ? real(dpy, resolved_draw, resolved_read, ctx) : 0;
+    if (std::getenv("MACAPK_EGL_TRACE")) {
+        static std::atomic<unsigned> count{0};
+        if (count.fetch_add(1) < 100)
+            std::fprintf(stderr, "[egl-trace] eglMakeCurrent dpy=%p draw=%p->%p read=%p->%p ctx=%p result=%u\n",
+                dpy,draw,resolved_draw,read,resolved_read,ctx,result);
+    }
+    return result;
 }
 
 // eglQuerySurface: a forward to ANGLE that names a Java EGL14 window's current
@@ -38293,6 +38335,27 @@ extern "C" void __macapk_arm64_glBlitFramebufferNV(int a,int b,int c,int d,
             dlsym(RTLD_DEFAULT, "glBlitFramebufferNV"));
     if (real) real(a,b,c,d,e,f,g,h,(unsigned)mask_slot,(unsigned)filter_slot);
 }
+// Chromium's texture-copy extensions also put packed ints/bools after x7.
+extern "C" void __macapk_arm64_glCopyTextureCHROMIUM(unsigned source, int level,
+        unsigned target, unsigned dest, int dest_level, int format, unsigned type,
+        unsigned char flip, uint64_t premultiply, uint64_t unmultiply) {
+    using Copy = void (*)(unsigned,int,unsigned,unsigned,int,int,unsigned,
+                          unsigned char,unsigned char,unsigned char);
+    static auto real = reinterpret_cast<Copy>(dlsym(RTLD_DEFAULT, "glCopyTextureCHROMIUM"));
+    if (real) real(source,level,target,dest,dest_level,format,type,flip,
+                   (unsigned char)premultiply,(unsigned char)unmultiply);
+}
+extern "C" void __macapk_arm64_glCopySubTextureCHROMIUM(unsigned source, int level,
+        unsigned target, unsigned dest, int dest_level, int xoffset, int yoffset, int x,
+        uint64_t y, uint64_t width, uint64_t height, uint64_t flip,
+        uint64_t premultiply, uint64_t unmultiply) {
+    using Copy = void (*)(unsigned,int,unsigned,unsigned,int,int,int,int,int,int,int,
+                          unsigned char,unsigned char,unsigned char);
+    static auto real = reinterpret_cast<Copy>(dlsym(RTLD_DEFAULT, "glCopySubTextureCHROMIUM"));
+    if (real) real(source,level,target,dest,dest_level,xoffset,yoffset,x,(int)y,
+                   (int)width,(int)height,(unsigned char)flip,
+                   (unsigned char)premultiply,(unsigned char)unmultiply);
+}
 extern "C" void __macapk_arm64_glTexSubImage3D(unsigned target, int level, int x, int y, int z, int w,
         int h, int d, uint64_t fmt_slot, uint64_t type_slot, const void* px) {
     static void (*real)(unsigned, int, int, int, int, int, int, int, unsigned, unsigned, const void*) =
@@ -38363,6 +38426,8 @@ static void* macapk_aapcs64_slot_proc(const char* name) {
         {"glBlitFramebuffer", reinterpret_cast<void*>(&__macapk_arm64_glBlitFramebuffer)},
         {"glBlitFramebufferANGLE", reinterpret_cast<void*>(&__macapk_arm64_glBlitFramebufferANGLE)},
         {"glBlitFramebufferNV", reinterpret_cast<void*>(&__macapk_arm64_glBlitFramebufferNV)},
+        {"glCopyTextureCHROMIUM", reinterpret_cast<void*>(&__macapk_arm64_glCopyTextureCHROMIUM)},
+        {"glCopySubTextureCHROMIUM", reinterpret_cast<void*>(&__macapk_arm64_glCopySubTextureCHROMIUM)},
         {"glCopyImageSubData", reinterpret_cast<void*>(&__macapk_arm64_glCopyImageSubData)},
         {"glCopyImageSubDataEXT", reinterpret_cast<void*>(&__macapk_arm64_glCopyImageSubDataEXT)},
         {"glCopyImageSubDataOES", reinterpret_cast<void*>(&__macapk_arm64_glCopyImageSubDataOES)},
@@ -38514,6 +38579,7 @@ extern "C" void __macapk_arm64_glGetQueryiv(int target, int pname, int* params) 
 // its own window surface at all.
 extern "C" unsigned __macapk_arm64_eglInitialize(void* dpy, int32_t* major, int32_t* minor);
 extern "C" unsigned __macapk_arm64_eglTerminate(void* dpy);
+extern "C" const char* __macapk_arm64_eglQueryString(void* dpy, int32_t name);
 extern "C" void* __macapk_arm64_eglGetProcAddress(const char* name) {
     using GpaFn = void* (*)(const char*);
     static GpaFn real =
@@ -38528,6 +38594,19 @@ extern "C" void* __macapk_arm64_eglGetProcAddress(const char* name) {
             std::fprintf(stderr, "[unity-surf] eglGetProcAddress(\"%s\")\n", name);
     }
     if (void* slot = macapk_aapcs64_slot_proc(name)) return slot;
+    if (name && std::strcmp(name, "eglCreateWindowSurface") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_egl_create_window_surface_bridge);
+    if (name && std::strcmp(name, "eglMakeCurrent") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglMakeCurrent);
+    if (name && std::strcmp(name, "eglQuerySurface") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglQuerySurface);
+    if (name && std::strcmp(name, "eglQueryString") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglQueryString);
+    if (name && std::strcmp(name, "eglDestroySurface") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglDestroySurface);
+    if (name && (std::strcmp(name, "eglSwapBuffersWithDamageKHR") == 0 ||
+                 std::strcmp(name, "eglSwapBuffersWithDamageEXT") == 0))
+        return reinterpret_cast<void*>(&__macapk_arm64_eglSwapBuffersWithDamageKHR);
     // The refcounted pair (see __macapk_egl_display_ref), whichever way the
     // guest resolves it.
     if (name && std::strcmp(name, "eglInitialize") == 0)
@@ -38821,6 +38900,10 @@ extern "C" void* __macapk_arm64_eglCreateContext(void* dpy, void* config,
     return r;
 }
 extern "C" unsigned __macapk_arm64_eglGetError(void) {
+    static auto window_error = reinterpret_cast<int(*)()>(
+        dlsym(RTLD_DEFAULT, "__macapk_egl14_window_error"));
+    int pending = window_error ? window_error() : 0;
+    if (pending) return static_cast<unsigned>(pending);
     using Fn = unsigned (*)(void);
     static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglGetError"));
     unsigned r = real ? real() : 0x3000;
@@ -38840,6 +38923,7 @@ extern "C" const char* __macapk_arm64_eglQueryString(void* dpy, int32_t name) {
     using Fn = const char* (*)(void*, int32_t);
     static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglQueryString"));
     const char* r = real ? real(dpy, name) : nullptr;
+    r = MacapkEglExtensionsForBridge(r, dpy != nullptr, name);
     if (macapk_egl_trace_enabled())
         std::fprintf(stderr, "[egl-trace] eglQueryString(dpy=%p, 0x%x) -> %s\n",
                      dpy, name, r ? r : "(null)");
@@ -38941,6 +39025,7 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
     // counted, or it tears the display down under them.
     if (!std::strcmp(name, "eglInitialize")) return (void*)&__macapk_arm64_eglInitialize;
     if (!std::strcmp(name, "eglTerminate"))  return (void*)&__macapk_arm64_eglTerminate;
+    if (!std::strcmp(name, "eglQueryString")) return (void*)&__macapk_arm64_eglQueryString;
     // The remaining init-call passthroughs are diagnostic-only (route under
     // MACAPK_EGL_TRACE=1; else the guest gets ANGLE's directly).
     if (macapk_egl_trace_enabled()) {
@@ -38948,7 +39033,6 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
         if (!std::strcmp(name, "eglCreateContext"))return (void*)&__macapk_arm64_eglCreateContext;
         if (!std::strcmp(name, "eglGetError"))     return (void*)&__macapk_arm64_eglGetError;
         if (!std::strcmp(name, "eglBindAPI"))      return (void*)&__macapk_arm64_eglBindAPI;
-        if (!std::strcmp(name, "eglQueryString"))  return (void*)&__macapk_arm64_eglQueryString;
     }
     // Catch Unity's Swappy frame-pacing layer resolving the present hook.
     // Swappy (compiled into libunity as UnitySwappy_*) does
@@ -38976,6 +39060,22 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
         return reinterpret_cast<void*>(&__macapk_arm64_eglMakeCurrent);
     if (std::strcmp(name, "eglQuerySurface") == 0)
         return reinterpret_cast<void*>(&__macapk_arm64_eglQuerySurface);
+    if (std::strcmp(name, "eglInitialize") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglInitialize);
+    if (std::strcmp(name, "eglTerminate") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglTerminate);
+    if (std::strcmp(name, "eglGetError") == 0)
+        return reinterpret_cast<void*>(&__macapk_arm64_eglGetError);
+    if (std::getenv("MACAPK_FBO_TRACE") && std::strcmp(name, "glBindFramebuffer") == 0) {
+        if (!g_real_glBindFramebuffer) g_real_glBindFramebuffer = dlsym(RTLD_DEFAULT, name);
+        return reinterpret_cast<void*>(&__macapk_arm64_glBindFramebuffer_trace);
+    }
+    if (macapk_trace_viewport_on()) {
+        if (std::strcmp(name, "glViewport") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glViewport);
+        if (std::strcmp(name, "glScissor") == 0)
+            return reinterpret_cast<void*>(&__macapk_arm64_glScissor);
+    }
     // (The MACAPK_UNITY_PRESENT / MACAPK_TRACE_GL route of glFlush / glFinish /
     // glClear / glBindFramebuffer / glBlitFramebuffer to our shims is DELETED with
     // the present injection; see __macapk_arm64_eglMakeCurrent. The EGL routes
@@ -39104,6 +39204,7 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
         if (__macapk_elfexec_guest_dlsym(handle, name, &p)) return p;
     }
     if (handle == &g_libegl_marker || handle == &g_libglesv2_marker) {
+        if (void* slot = macapk_aapcs64_slot_proc(name)) return slot;
         // Route Unity's egl*/gl* lookups to our in-process ANGLE
         // (libEGL.dylib / libGLESv2.dylib export these under the same
         // extern-C names). One exception: eglCreateWindowSurface gets
@@ -39117,6 +39218,15 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
                 "-> CAMetalLayer bridge\n");
             return reinterpret_cast<void*>(
                 &__macapk_arm64_egl_create_window_surface_bridge);
+        }
+        if (handle == &g_libegl_marker) {
+            if (std::strcmp(name, "eglMakeCurrent") == 0) return (void*)&__macapk_arm64_eglMakeCurrent;
+            if (std::strcmp(name, "eglQuerySurface") == 0) return (void*)&__macapk_arm64_eglQuerySurface;
+            if (std::strcmp(name, "eglSwapBuffers") == 0) return (void*)&__macapk_arm64_eglSwapBuffers;
+            if (std::strcmp(name, "eglDestroySurface") == 0) return (void*)&__macapk_arm64_eglDestroySurface;
+            if (std::strcmp(name, "eglSwapBuffersWithDamageKHR") == 0 ||
+                std::strcmp(name, "eglSwapBuffersWithDamageEXT") == 0)
+                return (void*)&__macapk_arm64_eglSwapBuffersWithDamageKHR;
         }
         void* p = dlsym(RTLD_DEFAULT, name);
         std::fprintf(stderr,
@@ -42408,6 +42518,13 @@ static std::string macapk_arm64_remap_path_unguarded(const char* p) {
     };
     const char* root = __macapk_get_android_root();
     const char* apkt = __macapk_get_apkt_dir();
+    // Supplied platform files must be visible to directory walks as well as open/stat.
+    if (root && (s == "/system" || s.rfind("/system/", 0) == 0
+            || s == "/apex" || s.rfind("/apex/", 0) == 0)) {
+        std::string platform = std::string(root) + s;
+        struct stat supplied;
+        if (::stat(platform.c_str(), &supplied) == 0) return platform;
+    }
     // cocos2d-x v2 (CCNewFileUtilsAndroid) opens the APK as a ZIP via minizip
     // (unzOpen -> fopen the ".apk") to read assets/ into its ZipEntryInfo map.
     // Return the REAL apk file so the zip read finds assets/. The old redirect
@@ -43820,7 +43937,7 @@ extern "C" int __macapk_arm64_stat(const char* path, BionicStat* st) {
     int c = count.fetch_add(1);
     std::string remapped = macapk_arm64_remap_path(path);
     struct stat host;
-    int rc = stat(remapped.c_str(), &host);
+    int rc = macapk_shared_memory::stat_device(path, host) ? 0 : stat(remapped.c_str(), &host);
     if (rc == 0 && macapk_procfs_stat_on() && macapk_is_datadir_path(path)) macapk_datadir_stat_fixup(host);
     if (rc == 0) macos_to_bionic_stat(host, st);
     if (c < 50 || rc != 0) {
@@ -43837,7 +43954,7 @@ extern "C" int __macapk_arm64_lstat(const char* path, BionicStat* st) {
     if (!path || !st) return -1;
     std::string remapped = macapk_arm64_remap_path(path);
     struct stat host;
-    int rc = lstat(remapped.c_str(), &host);
+    int rc = macapk_shared_memory::stat_device(path, host) ? 0 : lstat(remapped.c_str(), &host);
     if (rc == 0 && macapk_procfs_stat_on() && macapk_is_datadir_path(path)) macapk_datadir_stat_fixup(host);
     if (rc == 0) macos_to_bionic_stat(host, st);
     macapk_arm64_log_open("lstat", path, remapped,
@@ -43936,6 +44053,7 @@ extern "C" int __macapk_arm64_fstat(int fd, BionicStat* st) {
     struct stat host;
     int rc = fstat(fd, &host);
     if (rc == 0) {
+        macapk_shared_memory::stat_region(fd, host);
         if (macapk_procfs_stat_on()) {
             // F_GETPATH resolves the fd back to its path; the guest only ever sees the
             // Android path, so matching on OUR synth path is the reliable test.
@@ -44512,7 +44630,14 @@ extern "C" int __macapk_arm64_getpagesize(void) {
     std::fflush(stderr);
     return v;
 }
+// Linux permits times(NULL); Darwin dereferences its output argument.
+extern "C" clock_t __macapk_arm64_times(struct tms* output) {
+    struct tms scratch{};
+    return ::times(output ? output : &scratch);
+}
+
 extern "C" unsigned long __stack_chk_guard;  // for AT_RANDOM canary consistency (case 25)
+extern "C" unsigned long __macapk_arm64_native_auxv(unsigned long);
 extern "C" unsigned long __macapk_arm64_getauxval(unsigned long type) {
     // DIAGNOSTIC + honest-fidelity options for the pairip +0x440c4 length/navigation
     // provenance (docs/pairip-vm-length-provenance + the 2026-09-08 length-provenance
@@ -44555,6 +44680,11 @@ extern "C" unsigned long __macapk_arm64_getauxval(unsigned long type) {
         }
     }
     switch (type) {
+        case 3: // AT_PHDR: real guest-loader metadata and loaded guest ELF link maps.
+        case 4: // AT_PHENT
+        case 5: // AT_PHNUM
+            v = __macapk_arm64_native_auxv(type);
+            break;
         case 16:  // AT_HWCAP
             // MEASURED on the reference device (`su 0 cat /proc/<pid>/auxv`, 2026-09-11):
             // AT_HWCAP = 0xffb3ffff, AT_HWCAP2 = 0x4181. The old 0xFFFF was a FABRICATED
@@ -45209,10 +45339,13 @@ extern "C" int __macapk_arm64_pipe2(int fds[2], int flags) {
 // 64-bit, so these forward straight to the base calls.
 extern "C" ssize_t __macapk_arm64_pwrite64(int fd, const void* buf,
                                              size_t count, int64_t offset) {
-    return macapk_rw_face(::pwrite(fd, buf, count, (off_t)offset));
+    return __macapk_arm64_pwrite(fd, buf, count, (off_t)offset);
+}
+extern "C" int __macapk_arm64_ftruncate(int fd, off_t length) {
+    return macapk_shared_memory::truncate(fd, length);
 }
 extern "C" int __macapk_arm64_ftruncate64(int fd, int64_t length) {
-    return ::ftruncate(fd, (off_t)length);
+    return __macapk_arm64_ftruncate(fd, (off_t)length);
 }
 // __pread64_chk -- FORTIFY variant of pread64. bionic aborts when
 // count > buf_size; we log and clamp (lenient mode, matching the rest
@@ -45510,7 +45643,9 @@ extern "C" int __macapk_arm64_fstatat(int dirfd, const char* path,
     // resolved against a real dirfd is already host-rooted.
     bool remapped_proc = false;
     std::string remapped;
-    if (macapk_at_path(dirfd, path, remapped)) {
+    if (macapk_shared_memory::stat_device(path, host)) {
+        rc = 0;
+    } else if (macapk_at_path(dirfd, path, remapped)) {
         rc = ::fstatat(AT_FDCWD, remapped.c_str(), &host, mflags);
         remapped_proc = macapk_procfs_stat_on() && macapk_is_procfs_synth(remapped.c_str());
     } else {
@@ -47561,6 +47696,10 @@ extern "C" int __macapk_arm64_dup(int oldfd) {
     macapk_efd_dup(oldfd, r);
     return r;
 }
+extern "C" int __macapk_arm64_close(int fd) {
+    __macapk_arm64_forget_dirfd(fd);
+    return macapk_shared_memory::close(fd);
+}
 extern "C" int __macapk_arm64_dup2(int oldfd, int newfd) {
     // Linux dup2(fd, fd) is a no-op returning fd (no EINVAL, unlike dup3),
     // but still EBADF for a closed fd -- fcntl(F_GETFD) is the cheap validity
@@ -47847,7 +47986,9 @@ extern "C" int __macapk_arm64_prctl(int op, unsigned long a2,
                                     unsigned long a5);
 extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
                                         int flags, int fd, off_t offset);
+extern "C" int __macapk_arm64_munmap(void* addr, size_t length);
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot);
+extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp);
 extern "C" int __macapk_arm64_madvise(void* addr, size_t len, int advice);
 extern "C" ssize_t __macapk_arm64_process_vm_readv(
         pid_t /*pid*/, const void* /*lvec*/, unsigned long /*lcnt*/,
@@ -48447,6 +48588,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
             }
             return r;
         }
+        case 153: return (long)__macapk_arm64_times((struct tms*)macapk_untag_ptr((void*)a1));
         case 169: {  // SYS_gettimeofday (struct timeval*=a1, timezone*=a2)
             // Full 8-byte Bionic timeval write, same as
             // __macapk_arm64_gettimeofday (Darwin's 4-byte tv_usec leaves the
@@ -48831,8 +48973,9 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         // never actually reached this table before. A guest that opens a file
         // and cannot close it leaks an fd every iteration, and one that cannot
         // seek reads the wrong bytes, so neither is a tolerable -ENOSYS.
-        case 57:  __macapk_arm64_forget_dirfd((int)a1);  // drop any DIR* we opened behind it
-                  return (long)::close((int)a1);  // close: no Bionic/Darwin ABI delta
+        case 29:  return (long)__macapk_arm64_ioctl((int)a1, (int)a2, (void*)macapk_untag_ptr((void*)a3));
+        case 57:  return (long)__macapk_arm64_close((int)a1);
+        case 46:  return (long)__macapk_arm64_ftruncate((int)a1, (off_t)a2);
         case 61:  return __macapk_arm64_getdents64((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3);  // getdents64
         // 172/173/174/175/176/177 were NOT wired, so a guest using the RAW svc path (which
         // pairip does deliberately, to dodge libc hooks) got -1 from getpid() -- a value no
@@ -48866,11 +49009,14 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 64:  if (!macapk_router_write_on())
                       return macapk_router_unimplemented(number, __builtin_return_address(0));
                   return (long)macapk_write_host((int)a1, (const void*)macapk_untag_ptr((void*)a2), (size_t)a3);  // write
+        case 66:  return (long)macapk_shared_memory::writev((int)a1, (const struct iovec*)macapk_untag_ptr((void*)a2), (int)a3);
         case 67:  return (long)::pread((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3, (off_t)a4);  // pread64
-        case 68:  return (long)::pwrite((int)a1, (const void*)a2, (size_t)a3, (off_t)(int64_t)a4);  // pwrite64
+        case 68:  return (long)macapk_shared_memory::write((int)a1, (size_t)a3, (off_t)(int64_t)a4,
+                      [&] { return ::pwrite((int)a1, (const void*)macapk_untag_ptr((void*)a2), (size_t)a3, (off_t)(int64_t)a4); });
         case 78:  return (long)__macapk_arm64_readlinkat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (char*)macapk_untag_ptr((void*)a3), (size_t)a4);  // readlinkat
         case 79:  return (long)__macapk_arm64_fstatat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (BionicStat*)macapk_untag_ptr((void*)a3), (int)a4);  // fstatat
         case 80:  return (long)__macapk_arm64_fstat((int)a1, (BionicStat*)macapk_untag_ptr((void*)a2));  // fstat
+        case 101:  return (long)::nanosleep((const struct timespec*)macapk_untag_ptr((void*)a1), (struct timespec*)macapk_untag_ptr((void*)a2));
         case 115:  return (long)__macapk_arm64_clock_nanosleep((int)a1, (int)a2, (const struct timespec*)a3, (struct timespec*)macapk_untag_ptr((void*)a4));  // clock_nanosleep
         case 118:  return (long)__macapk_arm64_sched_setparam((pid_t)a1, (const void*)a2);  // sched_setparam
         case 120:  return (long)__macapk_arm64_sched_getscheduler((pid_t)a1);  // sched_getscheduler
@@ -48890,6 +49036,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 207:  return macapk_router_from_linux((long)__macapk_arm64_recvfrom((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3, (int)a4, (struct sockaddr*)macapk_untag_ptr((void*)a5), (socklen_t*)a6));  // recvfrom
         case 208:  return macapk_router_from_linux((long)__macapk_arm64_setsockopt((int)a1, (int)a2, (int)a3, (const void*)a4, (socklen_t)a5));  // setsockopt
         case 209:  return macapk_router_from_linux((long)__macapk_arm64_getsockopt((int)a1, (int)a2, (int)a3, (void*)macapk_untag_ptr((void*)a4), (socklen_t*)a5));  // getsockopt
+        case 215:  return (long)__macapk_arm64_munmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2);  // munmap
         case 216:  return (long)__macapk_arm64_mremap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (size_t)a3, (int)a4);  // mremap
         case 222:  return (long)__macapk_arm64_mmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3, (int)a4, (int)a5, (off_t)a6);  // mmap
         case 226:  return (long)__macapk_arm64_mprotect((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3);  // mprotect
@@ -51522,6 +51669,21 @@ uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
 // one variadic argument arrives in x2 under AAPCS64, which is where this
 // non-variadic signature reads it.
 extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
+    if (macapk_shared_memory::enabled()) {
+        switch (static_cast<uint32_t>(op)) {
+            case 0x40087707: // ASHMEM_PIN
+            case 0x40087708: // ASHMEM_UNPIN
+            case 0x7709:    // ASHMEM_GET_PIN_STATUS
+                return macapk_shared_memory::pin_range(fd, (uint32_t)op, argp);
+            case 0x7706: return macapk_shared_memory::get_prot(fd); // ASHMEM_GET_PROT_MASK
+            case 0x40087705: return macapk_shared_memory::set_prot(fd, (int)(intptr_t)argp); // ASHMEM_SET_PROT_MASK
+            case 0x7704: {
+                off_t size = macapk_shared_memory::get_size(fd); // ASHMEM_GET_SIZE
+                if (size > INT_MAX) { errno = EOVERFLOW; return -1; }
+                return (int)size;
+            }
+        }
+    }
     unsigned long host_op = 0;
     switch (static_cast<uint32_t>(op)) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
@@ -57372,7 +57534,21 @@ static inline int macapk_bionic_to_mac_mmap_flags(int lin) {
 extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
                                         int flags, int fd, off_t offset) {
     int mac_flags = macapk_bionic_to_mac_mmap_flags(flags);
-    void* p = mmap(addr, length, prot, mac_flags, fd, offset);
+    std::unique_lock<std::mutex> reservation_lock;
+    const size_t host_page = (size_t)sysconf(_SC_PAGESIZE);
+    if (macapk_guest_pages::enabled()) {
+        reservation_lock = std::unique_lock<std::mutex>(macapk_guest_pages::state().mutex);
+        macapk_guest_pages::Range r;
+        if ((mac_flags & MAP_FIXED) && macapk_guest_pages::covered((uintptr_t)addr, length, host_page, r))
+            macapk_guest_pages::state().reservations.remove(r);
+    }
+    void* p = macapk_shared_memory::map(addr, length, prot, mac_flags, fd, offset);
+    if (macapk_guest_pages::enabled() && p != MAP_FAILED && fd == -1 && prot == PROT_NONE
+            && (mac_flags & MAP_ANON) && (mac_flags & MAP_PRIVATE) && !(mac_flags & MAP_FIXED)) {
+        macapk_guest_pages::Range r;
+        if (macapk_guest_pages::covered((uintptr_t)p, length, host_page, r))
+            macapk_guest_pages::state().reservations.add(r);
+    }
     // Low-volume diagnostic: first calls + every failure. The GC grows
     // its heap with many mmaps; logging the result address also lets us
     // confirm whether il2cpp tolerates the (possibly high) addresses
@@ -57393,6 +57569,17 @@ extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
             p == MAP_FAILED ? "  (FAILED)" : "");
     }
     return p;
+}
+
+extern "C" int __macapk_arm64_munmap(void* addr, size_t length) {
+    if (!macapk_guest_pages::enabled()) return ::munmap(addr, length);
+    auto& state = macapk_guest_pages::state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    const int rc = ::munmap(addr, length);
+    macapk_guest_pages::Range r;
+    if (rc == 0 && macapk_guest_pages::covered((uintptr_t)addr, length,
+            (size_t)sysconf(_SC_PAGESIZE), r)) state.reservations.remove(r);
+    return rc;
 }
 
 // mmap64 is a SEPARATE exported symbol in bionic, not an alias: `mmap` only
@@ -57706,6 +57893,37 @@ bool macapk_range_hits_host_exec(uintptr_t lo, uintptr_t hi) {
 }
 } // namespace
 
+// Only promote non-executable pages inside a live guest-owned anonymous reserve.
+// This is an opt-in functional experiment, not faithful 4KB guard-page emulation.
+static int macapk_subpage_rw_commit(void* addr, size_t len) {
+    using namespace macapk_guest_pages;
+    Range r;
+    if (((uintptr_t)addr & 4095) || (len & 4095)
+            || !covered((uintptr_t)addr, len, (size_t)sysconf(_SC_PAGESIZE), r)) return -1;
+    auto& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (!s.reservations.contains(r) || macapk_range_hits_host_exec(r.lo, r.hi)) return -1;
+    for (mach_vm_address_t cursor = r.lo; cursor < r.hi;) {
+        mach_vm_address_t base = cursor;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t status = mach_vm_region(mach_task_self(), &base, &size,
+            VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object);
+        if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+        if (status != KERN_SUCCESS || base > cursor || !size || base + size <= cursor
+                || (info.protection & VM_PROT_EXECUTE)) return -1;
+        cursor = std::min<uint64_t>(r.hi, base + size);
+    }
+    const int rc = ::mprotect((void*)r.lo, r.hi - r.lo, PROT_READ | PROT_WRITE);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8)
+        std::fprintf(stderr, "[subpage-rw] EXPERIMENTAL guest=%p+%zu host=%p+%zu rc=%d; subpage guard boundaries are widened\n",
+            addr, len, (void*)r.lo, (size_t)(r.hi-r.lo), rc);
+    return rc;
+}
+
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
     // Guard: the guest must never re-protect OUR host code. If the requested
     // range overlaps a host executable segment we refuse it (report success,
@@ -57771,6 +57989,19 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
             int rc2 = ::mprotect(addr, len, prot & ~PROT_EXEC);   // RWX -> RW
             if (rc2 == 0) rc = 0;
         }
+    }
+    if (rc != 0 && errno == EINVAL && prot == (PROT_READ | PROT_WRITE)
+            && macapk_guest_pages::enabled()) {
+        const int failure_errno = errno;
+        if (macapk_subpage_rw_commit(addr, len) == 0) rc = 0;
+        else errno = failure_errno;
+    }
+    if (rc != 0 && std::getenv("MACAPK_MPROTECT_TRACE")) {
+        const int failure_errno = errno;
+        std::fprintf(stderr,
+            "[mprot-failure] addr=%p len=%zu prot=0x%x errno=%d caller=%p\n",
+            addr, len, prot, failure_errno, __builtin_return_address(0));
+        errno = failure_errno;
     }
     if (std::getenv("MACAPK_MPROTECT_TRACE") &&
         (prot & PROT_EXEC) && ((uintptr_t)addr < 0x200000000ull || (uintptr_t)addr >= 0x400000000ull)) {
@@ -57874,6 +58105,10 @@ extern "C" long __macapk_arm64___readlink_chk(const char* path, char* buf,
 // mmap/ftruncate use ashmem is for. libstartup / graphics libs use it for shared
 // buffers.
 extern "C" int __macapk_arm64_ASharedMemory_create(const char* name, size_t size) {
+    if (macapk_shared_memory::enabled() && (size == 0 || size > (uint64_t)INT64_MAX)) {
+        errno = EINVAL; return -1;
+    }
+    if (macapk_shared_memory::enabled()) return macapk_shared_memory::create((off_t)size);
     int fd = __macapk_arm64_memfd_create(name ? name : "ashmem", 0x0001U /*MFD_CLOEXEC*/);
     if (fd < 0) return -1;
     if (size && ::ftruncate(fd, (off_t)size) != 0) {
@@ -57881,9 +58116,16 @@ extern "C" int __macapk_arm64_ASharedMemory_create(const char* name, size_t size
     }
     return fd;
 }
+extern "C" int __macapk_arm64_ASharedMemory_setProt(int fd, int prot) {
+    return macapk_shared_memory::set_prot(fd, prot);
+}
 // ASharedMemory_getSize(fd): our ashmem fd is a plain (unlinked) file, so its
 // size is what ftruncate set. fstat reports it.
 extern "C" size_t __macapk_arm64_ASharedMemory_getSize(int fd) {
+    if (macapk_shared_memory::enabled()) {
+        off_t size = macapk_shared_memory::get_size(fd);
+        return size < 0 ? 0 : (size_t)size;
+    }
     struct stat st;
     if (fd >= 0 && ::fstat(fd, &st) == 0 && st.st_size > 0) return (size_t)st.st_size;
     return 0;
@@ -59443,10 +59685,9 @@ __attribute__((naked)) static void macapk_remarshal_generic() {
         // EL0 exception returns (requires the custom-x18-abi-toggle
         // entitlement). x9 is caller-saved scratch, free at entry and reloaded
         // below before use; x0..x7/v0..v7 (the args), x18 and lr are untouched.
-        // Guarded by the bit test so re-entry is free. This covers only the
-        // ABI-divergent natives that get a thunk; non-divergent guest natives
-        // that HotSpot calls as a raw fn pointer self-heal via the
-        // __macapk_arm64_clock_gettime catch-all on first shim use. See
+        // Guarded by the bit test so re-entry is free. Every guest JNI entry
+        // needs this, even when its arguments already share the same layout:
+        // a fresh JVM thread may use x18 before its first clock shim. See
         // docs/x18-custom-abi-toggle-entitlement_2026-07-14.md.
         "mrs x9, TPIDR_EL0\n"
         "tst x9, #0x1000000000000\n"        // bit 48 already set?
@@ -59514,9 +59755,7 @@ bool macapk_fn_in_guest_image(const void* fn) {
 }
 
 // Copy `len` bytes of code into a fresh executable page (W^X: write RW, flip to
-// RX, flush icache). One page per thunk -- thunks are rare (only divergent
-// guest natives) so the page-granularity waste is negligible and this needs no
-// shared mutable state, so it is trivially thread-safe.
+// RX, flush icache). One page per thunk; no shared mutable allocation state.
 void* macapk_alloc_exec(const void* code, size_t len) {
     long pg = sysconf(_SC_PAGESIZE);
     size_t alloc = (len + (size_t)pg - 1) & ~((size_t)pg - 1);
@@ -59533,11 +59772,9 @@ void* macapk_alloc_exec(const void* code, size_t len) {
     return m;
 }
 
-// Parse a JNI method signature and, IF the Apple and AAPCS64 stack layouts
-// diverge, build + return a re-marshalling thunk to register in place of
-// real_fn. Returns nullptr when no wrap is needed (the common case: all args
-// in registers, or no sub-word stack arg shifts a later arg) or on any parse
-// uncertainty (fail safe -> passthrough). is_static is irrelevant: a static
+// Build the guest JNI entry: enable per-thread x18 preservation and copy any
+// stack arguments into AAPCS64 slots. Register-only entries still need the
+// protection setup. Returns nullptr on parse uncertainty. is_static is irrelevant: a static
 // method's jclass and an instance method's `this` each consume exactly one int
 // register (x1) after env (x0), so java args always begin at x2 either way.
 bool macapk_nmb_subint_as_int() {
@@ -59557,7 +59794,6 @@ void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
     uint32_t n_moves = 0;
     uint32_t apple_cur = 0, aapcs_cur = 0;
     uint32_t int_reg = 2, fp_reg = 0;   // env(x0) + jclass-or-this(x1)
-    bool diverged = false;
     while (*p && *p != ')') {
         char c = *p;
         uint32_t size = 0, align = 0;
@@ -59606,7 +59842,6 @@ void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
         uint32_t c_off = (aapcs_cur + 7u) & ~7u;
         apple_cur = a_off + size;
         aapcs_cur = c_off + 8;
-        if (a_off != c_off) diverged = true;
         if (n_moves >= 128) return nullptr;   // pathological arity -> bail safe
         moves[n_moves].src = (uint16_t)a_off;
         moves[n_moves].dst = (uint16_t)c_off;
@@ -59614,7 +59849,7 @@ void* macapk_build_aapcs_thunk(const char* sig, void* real_fn) {
         moves[n_moves].pad = 0;
         ++n_moves;
     }
-    if (!diverged || n_moves == 0) return nullptr;
+    if (*p != ')') return nullptr;
     uint32_t aapcs_size = (aapcs_cur + 15u) & ~15u;   // keep sp 16-aligned
 
     // Thunk image: 3 instrs + generic-tramp ptr + descriptor.
@@ -60294,6 +60529,7 @@ static jclass macapk_findclass_noinit(JNIEnv* env, const char* name) {
 // or the app loader (already tried), or on a genuine miss -- all of which fall through to the
 // previous behaviour unchanged.
 static jclass macapk_findclass_onload_ctx_noinit(JNIEnv* env, const char* name) {
+    static const bool trace = std::getenv("MACAPK_JNI_LOADER_TRACE") != nullptr;
     static jclass s_nl = nullptr;           // jdk/internal/loader/NativeLibraries (global ref)
     static jclass s_class_cls = nullptr;    // java/lang/Class (global ref)
     static jmethodID s_from = nullptr;      // NativeLibraries.getFromClass()
@@ -60314,7 +60550,10 @@ static jclass macapk_findclass_onload_ctx_noinit(JNIEnv* env, const char* name) 
         s_for_name = g_orig_GetStaticMethodID(env, cc, "forName",
             "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;");
         if (env->ExceptionCheck()) env->ExceptionClear();
-        if (!s_from || !s_get_loader || !s_for_name) { s_failed = true; return nullptr; }
+        if (!s_from || !s_get_loader || !s_for_name) {
+            if (trace) std::fprintf(stderr, "[jni-loader] missing IDs from=%d loader=%d forName=%d\n", !!s_from, !!s_get_loader, !!s_for_name);
+            s_failed = true; return nullptr;
+        }
         s_nl = static_cast<jclass>(env->NewGlobalRef(nl));
         s_class_cls = static_cast<jclass>(env->NewGlobalRef(cc));
     }
@@ -60322,6 +60561,21 @@ static jclass macapk_findclass_onload_ctx_noinit(JNIEnv* env, const char* name) 
     if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
     if (!from) return nullptr;                       // not inside JNI_OnLoad
     jobject loader = env->CallObjectMethod(from, s_get_loader);
+    if (trace && !env->ExceptionCheck()) {
+        jmethodID get_name = g_orig_GetMethodID(env, s_class_cls, "getName", "()Ljava/lang/String;");
+        if (get_name && !env->ExceptionCheck()) {
+            auto from_name = static_cast<jstring>(env->CallObjectMethod(from, get_name));
+            if (from_name && !env->ExceptionCheck()) {
+                const char* text = env->GetStringUTFChars(from_name, nullptr);
+                if (text) {
+                    std::fprintf(stderr, "[jni-loader] FindClass(%s), JNI_OnLoad caller=%s, loader=%p\n", name, text, loader);
+                    env->ReleaseStringUTFChars(from_name, text);
+                }
+                env->DeleteLocalRef(from_name);
+            }
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear(); // diagnostics must not change lookup state
+    }
     env->DeleteLocalRef(from);
     if (env->ExceptionCheck()) { env->ExceptionClear(); return nullptr; }
     if (!loader) return nullptr;                     // boot loader: HotSpot's path is right
@@ -60456,9 +60710,8 @@ jint macapk_RegisterNatives_wrap(JNIEnv* env, jclass clazz,
                 "present\n", copy[i].signature ? copy[i].signature : "?");
             continue;
         }
-        // Apple-vs-AAPCS64 stack-arg re-marshal: wrap only GUEST (Android-
-        // compiled) native fns whose signature the two ABIs lay out
-        // differently. JDK natives are Apple-compiled (not in a guest image)
+        // Guest JNI entries need x18 setup as well as any stack re-packing.
+        // JDK natives are Apple-compiled (not in a guest image)
         // and pass through untouched. See the bridge note above.
         if (s_abi_remarshal && copy[i].fnPtr && copy[i].signature
             && macapk_fn_in_guest_image(copy[i].fnPtr)) {
@@ -60466,8 +60719,7 @@ jint macapk_RegisterNatives_wrap(JNIEnv* env, jclass clazz,
                                                    copy[i].fnPtr);
             if (thunk) {
                 std::fprintf(stderr,
-                    "[abi-remarshal] wrapped %s%s @ %p (Apple->AAPCS64 stack "
-                    "repack)\n",
+                    "[abi-remarshal] wrapped %s%s @ %p (guest JNI entry / AAPCS64 stack)\n",
                     copy[i].name ? copy[i].name : "?",
                     copy[i].signature, copy[i].fnPtr);
                 copy[i].fnPtr = thunk;
@@ -61646,7 +61898,7 @@ void JNICALL macapk_NativeMethodBind(jvmtiEnv* jvmti, JNIEnv* /*jni*/,
                     "[nmb-remarshal] %s%s @ %p -> thunk %p (name-based Apple->AAPCS64)\n",
                     name ? name : "?", sig, address, thunk);
             } else if (std::getenv("MACAPK_NMB_TRACE")) {
-                std::fprintf(stderr, "[nmb] guest native %s%s @ %p (no divergence)\n",
+                std::fprintf(stderr, "[nmb] guest native %s%s @ %p (entry bridge unavailable)\n",
                     name ? name : "?", sig, address);
             }
         }
@@ -64150,7 +64402,62 @@ alignas(16) static uint8_t g_macapk_dummy_ANativeWindow[4096] = {0};
 // THAT rather than a 1080x1920 literal an engine would size its viewport and
 // render targets from. The literal is only a last resort for a query that
 // arrives before any window exists at all.
+static jobject macapk_stream_surface(JNIEnv* env, void* window) {
+    std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+    auto it = g_stream_windows.find(window);
+    return it == g_stream_windows.end() ? nullptr : env->NewLocalRef(it->second->surface);
+}
+static bool macapk_stream_window_create(void* dpy, void* config, void* window,
+                                        const int32_t* attribs, void** result) {
+    AttachGuard guard;
+    if (!guard.env) return false;
+    jobject surface = macapk_stream_surface(guard.env, window);
+    if (!surface) return false;
+    using Create = void* (*)(JNIEnv*, void*, void*, jobject, const int32_t*);
+    static auto create = reinterpret_cast<Create>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_create"));
+    *result = create ? create(guard.env, dpy, config, surface, attribs) : nullptr;
+    guard.env->DeleteLocalRef(surface);
+    if (guard.env->ExceptionCheck()) {
+        guard.env->ExceptionDescribe();
+        guard.env->ExceptionClear();
+        *result = nullptr;
+    }
+    return true;
+}
+extern "C" unsigned __macapk_arm64_eglDestroySurface(void* dpy, void* surface) {
+    using Destroy = int (*)(JNIEnv*, void*, void*);
+    static auto destroy = reinterpret_cast<Destroy>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_destroy"));
+    AttachGuard guard;
+    int result = destroy && guard.env ? destroy(guard.env, dpy, surface) : -1;
+    if (guard.env && guard.env->ExceptionCheck()) {
+        guard.env->ExceptionDescribe(); guard.env->ExceptionClear(); return 0;
+    }
+    if (result >= 0) return result;
+    using Real = unsigned (*)(void*, void*);
+    static auto real = reinterpret_cast<Real>(dlsym(RTLD_DEFAULT, "eglDestroySurface"));
+    return real ? real(dpy, surface) : 0;
+}
+extern "C" unsigned __macapk_arm64_eglSwapBuffersWithDamageKHR(
+        void* dpy, void* surface, const int32_t* rects, int32_t count) {
+    using Real = unsigned (*)(void*, void*, const int32_t*, int32_t);
+    static auto real = reinterpret_cast<Real>(dlsym(RTLD_DEFAULT, "eglSwapBuffersWithDamageKHR"));
+    if (count < 0 || (count > 0 && !rects))
+        return real ? real(dpy, macapk_egl14_window_resolve(dpy, surface), rects, count) : 0;
+    // Damage is a hint: the stream bridge queues the complete frame already rendered.
+    auto window_swap = macapk_egl14_window_swap_fn();
+    int result = window_swap ? window_swap(dpy, surface) : -1;
+    if (result >= 0) {
+        if (!result) return 0;
+        using Swap = unsigned (*)(void*, void*);
+        static auto swap = reinterpret_cast<Swap>(dlsym(RTLD_DEFAULT, "eglSwapBuffers"));
+        return swap ? swap(dpy, macapk_egl14_window_resolve(dpy, surface)) : 0;
+    }
+    return real ? real(dpy, surface, rects, count) : __macapk_arm64_eglSwapBuffers(dpy, surface);
+}
 extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
+    { std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+      auto it = g_stream_windows.find(w);
+      if (it != g_stream_windows.end()) return it->second->width; }
     if (macapk_is_unity_window(w)) return g_macapk_unity_window.width;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.width > 0) {
@@ -64159,6 +64466,9 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
     return 1080;
 }
 extern "C" int32_t __macapk_arm64_ANativeWindow_getHeight(void* w) {
+    { std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+      auto it = g_stream_windows.find(w);
+      if (it != g_stream_windows.end()) return it->second->height; }
     if (macapk_is_unity_window(w)) return g_macapk_unity_window.height;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.height > 0) {
@@ -64190,8 +64500,20 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
                      set_geo ? "" : " -- no Cocoa bridge, ignored");
     return 0;
 }
-extern "C" void __macapk_arm64_ANativeWindow_release(void* /*w*/) {}
-extern "C" void __macapk_arm64_ANativeWindow_acquire(void* /*w*/) {}
+extern "C" void __macapk_arm64_ANativeWindow_release(void* w) {
+    jobject surface = nullptr;
+    { std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+      auto it = g_stream_windows.find(w);
+      if (it == g_stream_windows.end() || --it->second->references) return;
+      surface = it->second->surface; g_stream_windows.erase(it); }
+    AttachGuard guard;
+    if (guard.env) guard.env->DeleteGlobalRef(surface);
+}
+extern "C" void __macapk_arm64_ANativeWindow_acquire(void* w) {
+    std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+    auto it = g_stream_windows.find(w);
+    if (it != g_stream_windows.end()) ++it->second->references;
+}
 // The Java Surface the guest handed to ANativeWindow_fromSurface, kept as a
 // JNI GLOBAL ref so ANativeWindow_toSurface can hand the SAME object back.
 // NDK native_window_jni.h documents toSurface as the exact inverse of
@@ -64239,6 +64561,34 @@ static void macapk_remember_native_window_surface(jobject surface) {
 }
 extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
         void* /*env*/, void* surface) {
+    AttachGuard guard;
+    if (!surface || !guard.env || guard.env->ExceptionCheck()) return nullptr;
+    jclass cls = guard.env->GetObjectClass(reinterpret_cast<jobject>(surface));
+    jmethodID get = cls ? guard.env->GetMethodID(cls, "macapkGetSurfaceTexture",
+                                               "()Landroid/graphics/SurfaceTexture;") : nullptr;
+    jobject texture = get ? guard.env->CallObjectMethod(reinterpret_cast<jobject>(surface), get) : nullptr;
+    if (cls) guard.env->DeleteLocalRef(cls);
+    if (guard.env->ExceptionCheck()) return nullptr;
+    if (texture) {
+        jclass tc = guard.env->GetObjectClass(texture);
+        jmethodID width = guard.env->GetMethodID(tc, "macapkGetDefaultWidth", "()I");
+        jmethodID height = guard.env->GetMethodID(tc, "macapkGetDefaultHeight", "()I");
+        int w = width ? guard.env->CallIntMethod(texture, width) : 0;
+        int h = height ? guard.env->CallIntMethod(texture, height) : 0;
+        guard.env->DeleteLocalRef(tc); guard.env->DeleteLocalRef(texture);
+        if (guard.env->ExceptionCheck()) return nullptr;
+        std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+        for (auto& entry : g_stream_windows) {
+            if (guard.env->IsSameObject(entry.second->surface, reinterpret_cast<jobject>(surface))) {
+                ++entry.second->references; return entry.first;
+            }
+        }
+        jobject ref = guard.env->NewGlobalRef(reinterpret_cast<jobject>(surface));
+        if (!ref) return nullptr;
+        auto record = std::make_unique<MacApkStreamWindow>(MacApkStreamWindow{ref, 1, w, h});
+        void* handle = record.get(); g_stream_windows.emplace(handle, std::move(record));
+        return handle;
+    }
     macapk_remember_native_window_surface(reinterpret_cast<jobject>(surface));
     // v1.0.162: return a real ANativeWindow backed by the Cocoa
     // CAMetalLayer (pre-created on the main thread in drawInMTKView for
@@ -64302,15 +64652,16 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getFormat(void* w) {
 // NULL when no real Surface ever arrived, which is the documented answer for a
 // window that has no Java counterpart.
 extern "C" void* __macapk_arm64_ANativeWindow_toSurface(void* /*env*/,
-                                                        void* /*w*/) {
+                                                        void* w) {
+    AttachGuard ag;
+    if (!ag.env) return nullptr;
+    if (jobject surface = macapk_stream_surface(ag.env, w)) return surface;
     jobject gref = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
         gref = g_macapk_nw_surface_gref;
     }
     if (!gref) return nullptr;
-    AttachGuard ag;
-    if (!ag.env) return nullptr;
     jobject local = ag.env->NewLocalRef(gref);
     if (!local && ag.env->ExceptionCheck()) ag.env->ExceptionClear();
     return local;
@@ -64945,10 +65296,17 @@ struct MacApkLooper {
     // callback runs only on the thread polling its looper, so an owner-polled
     // looper must never be adopted as an orphan by the vsync feeder thread.
     std::atomic<bool> owner_polls{false};
+    bool retired = false;
+    unsigned active_native_polls = 0;
+    void close_wake_pipe() {
+        if (wake_r >= 0) ::close(wake_r);
+        if (wake_w >= 0) ::close(wake_w);
+        wake_r = wake_w = -1;
+    }
     // Lazily create the wake self-pipe (macOS has no eventfd; a non-blocking
     // self-pipe is the portable equivalent we poll() alongside the looper fds).
     void ensure_wake_pipe() {
-        if (wake_r >= 0) return;
+        if (retired || wake_r >= 0) return;
         int p[2];
         if (::pipe(p) == 0) {
             for (int f : p) {
@@ -64962,10 +65320,42 @@ struct MacApkLooper {
 thread_local MacApkLooper* t_looper = nullptr;
 std::mutex                 g_loopers_mu;
 std::vector<MacApkLooper*> g_loopers;     // registry for the vsync broadcast
+std::atomic<bool> g_loopers_stopping{false};
+struct MacApkLooperOwner {
+    MacApkLooper* looper = nullptr;
+    ~MacApkLooperOwner() {
+        if (!looper || g_loopers_stopping.load()) return;
+        std::lock_guard<std::mutex> registry_lock(g_loopers_mu);
+        std::lock_guard<std::mutex> lock(looper->mu);
+        g_loopers.erase(std::remove(g_loopers.begin(), g_loopers.end(), looper), g_loopers.end());
+        looper->retired = true;
+        looper->pending.clear(); looper->ready.clear(); looper->fds.clear();
+        if (!looper->active_native_polls) looper->close_wake_pipe();
+        // shortcut: retain retired handles until native/Java looper reference ownership is implemented.
+    }
+};
+thread_local MacApkLooperOwner t_looper_owner;
+struct MacApkNativePoll {
+    MacApkLooper* looper = nullptr;
+    explicit MacApkNativePoll(MacApkLooper* candidate) {
+        std::lock_guard<std::mutex> lock(candidate->mu);
+        if (!candidate->retired) { looper = candidate; ++looper->active_native_polls; }
+    }
+    ~MacApkNativePoll() {
+        if (!looper) return;
+        std::lock_guard<std::mutex> lock(looper->mu);
+        if (--looper->active_native_polls == 0 && looper->retired) looper->close_wake_pipe();
+    }
+};
 
 MacApkLooper* macapk_looper_ensure() {
     if (!t_looper) {
+        static const bool exit_hook = [] {
+            std::atexit([] { g_loopers_stopping.store(true); }); return true;
+        }();
+        (void)exit_hook;
         t_looper = new MacApkLooper();
+        t_looper_owner.looper = t_looper;
         t_looper->ensure_wake_pipe();
         std::lock_guard<std::mutex> lk(g_loopers_mu);
         g_loopers.push_back(t_looper);
@@ -64983,6 +65373,7 @@ void macapk_choreo_register_on(void* inst, void* fn, void* data, bool is64) {
         "[choreo] register #%d cb=%p data=%p is64=%d REGTID=%llu looper=%p\n",
         c, fn, data, is64, (unsigned long long)tid, (void*)L); }
     std::lock_guard<std::mutex> lk(L->mu);
+    if (L->retired) return;
     if (L->pending.size() < 256) L->pending.push_back({fn, data, is64});
 }
 
@@ -65478,6 +65869,7 @@ extern "C" int __macapk_arm64_ALooper_addFd(
         (unsigned long long)tid, (void*)L, (void*)t_looper); }
     {
         std::lock_guard<std::mutex> lk(L->mu);
+        if (L->retired) return -1;
         bool found = false;
         for (MacApkFd& f : L->fds)
             if (f.fd == fd) { f.ident=ident; f.events=events;
@@ -65502,6 +65894,7 @@ extern "C" int __macapk_looper_add_fd_plain(
     MacApkLooper* L = looper ? static_cast<MacApkLooper*>(looper) : t_looper;
     if (!L || fd < 0) return -1;
     std::lock_guard<std::mutex> lk(L->mu);
+    if (L->retired) return -1;
     for (MacApkFd& f : L->fds)
         if (f.fd == fd) { f.ident=ident; f.events=events;
                           f.callback=callback; f.data=data; f.plain=true; return 1; }
@@ -65760,8 +66153,10 @@ extern "C" void __macapk_looper_wake(void* looperPtr) {
     MacApkLooper* L = looperPtr ? static_cast<MacApkLooper*>(looperPtr)
                                   : t_looper;
     if (!L) return;
-    { std::lock_guard<std::mutex> lk(L->mu); L->wake_flag = true; }
-    if (L->wake_w >= 0) { uint8_t b = 1; (void)::write(L->wake_w, &b, 1); }
+    { std::lock_guard<std::mutex> lk(L->mu);
+      if (L->retired) return;
+      L->wake_flag = true;
+      if (L->wake_w >= 0) { uint8_t b = 1; (void)::write(L->wake_w, &b, 1); } }
     L->cv.notify_all();
 }
 
@@ -65780,10 +66175,12 @@ extern "C" void __macapk_looper_native_poll(void* looperPtr, int timeoutMs) {
                                   : t_looper;
     if (!L) { if (timeoutMs > 0) usleep((useconds_t)timeoutMs * 1000);
               else if (timeoutMs < 0) usleep(2000); return; }
+    MacApkNativePoll active(L);
+    if (!active.looper) return;
     if (L == t_looper) L->owner_polls.store(true, std::memory_order_relaxed);
-    L->ensure_wake_pipe();
     std::vector<MacApkFd> fds;
-    { std::lock_guard<std::mutex> lk(L->mu); fds = L->fds; L->wake_flag = false; }
+    { std::lock_guard<std::mutex> lk(L->mu);
+      L->ensure_wake_pipe(); fds = L->fds; L->wake_flag = false; }
     std::vector<struct pollfd> pfds;
     pfds.push_back(pollfd{L->wake_r, POLLIN, 0});       // index 0 = wake pipe
     for (const MacApkFd& f : fds) {
@@ -65797,6 +66194,7 @@ extern "C" void __macapk_looper_native_poll(void* looperPtr, int timeoutMs) {
     // lost wake can't hang a Looper thread forever (bounds quit() latency too).
     int to = (timeoutMs < 0) ? 250 : (timeoutMs > 250 ? 250 : timeoutMs);
     int r = ::poll(pfds.data(), (nfds_t)pfds.size(), to);
+    { std::lock_guard<std::mutex> lock(L->mu); if (L->retired) return; }
     if (std::getenv("MACAPK_LOOPER_POLL_TRACE")) {
         static std::atomic<int> pt{0};
         if (fds.size() >= 1 && pt.fetch_add(1) < 40) {
@@ -65956,7 +66354,7 @@ static void macapk_choreo_run_ready_on(MacApkLooper* self, int64_t fallback_ft) 
     int64_t ft = fallback_ft;
     {
         std::lock_guard<std::mutex> lk(self->mu);
-        if (self->ready.empty()) return;
+        if (self->retired || self->ready.empty()) return;
         cbs.swap(self->ready);
         ft = self->ready_ft;
     }

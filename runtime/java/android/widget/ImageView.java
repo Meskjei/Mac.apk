@@ -618,13 +618,17 @@ public class ImageView extends View {
                             }
                         }
                     }
-                    drawable.setBounds(0, 0, drawW, drawH);
+                    // Like Android, scale the canvas: animation drawables may draw at intrinsic size.
+                    boolean scaleDrawable = iw > 0 && ih > 0 && scaleType != ScaleType.FIT_XY;
+                    drawable.setBounds(0, 0, scaleDrawable ? iw : drawW,
+                            scaleDrawable ? ih : drawH);
                     // Offset into the content box (AOSP's
                     // `canvas.translate(mPaddingLeft, mPaddingTop)`).
                     dx += dPadL; dy += dPadT;
-                    if (dx != 0 || dy != 0) {
+                    if (dx != 0 || dy != 0 || scaleDrawable) {
                         int sv = canvas.save();
                         canvas.translate(dx, dy);
+                        if (scaleDrawable) canvas.scale((float) drawW / iw, (float) drawH / ih);
                         drawable.draw(canvas);
                         canvas.restoreToCount(sv);
                     } else {

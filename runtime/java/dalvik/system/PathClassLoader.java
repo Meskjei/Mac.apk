@@ -12,12 +12,7 @@
 // named subclass so the loader-identity checks resolve. We mirror exactly that:
 // a thin BaseDexClassLoader subclass with the two public ctors.
 //
-// Note: Mac.apk's real app loader is com.macapk.loader.AppClassLoader, which is
-// NOT this class (it has bespoke APK-serving + native-lib-translate behavior).
-// An app that does `getClassLoader() instanceof PathClassLoader` will see false
-// for the primary app loader; that is acceptable -- the load-bearing need is
-// that reflective CONSTRUCTION and the TYPE existing both succeed for plugin
-// frameworks that build their own PathClassLoader.
+// AppClassLoader extends this class, preserving Android's loader ancestry.
 package dalvik.system;
 
 public class PathClassLoader extends BaseDexClassLoader {
@@ -45,16 +40,10 @@ public class PathClassLoader extends BaseDexClassLoader {
      *  used directly. */
     public PathClassLoader(String dexPath, ClassLoader parent) {
         super(dexPath, null, null, parent);
-        // BaseDexClassLoader.buildUrls maps each path to a file: URL directly.
-        // For .dex/.apk plugin paths the caller should use DexClassLoader (which
-        // converts); PathClassLoader on a real device feeds DEX through ART. To
-        // keep the named-construction path functional for dex/apk inputs we
-        // additionally convert any non-class-file code paths.
-        addConvertedDexPaths(dexPath);
         macapkOpenNow();
     }
 
-    /** AOSP: second ctor adds an explicit library search path (advisory here).
+    /** AOSP: second ctor adds an explicit native library search path.
      *  DelegateLastClassLoader constructs through this one, so it inherits the
      *  open-now below; macapkOpenNow calls URLClassLoader.findResource
      *  non-virtually, so DelegateLast's child-first overrides do not run on
@@ -62,29 +51,7 @@ public class PathClassLoader extends BaseDexClassLoader {
     public PathClassLoader(String dexPath, String librarySearchPath,
                            ClassLoader parent) {
         super(dexPath, null, librarySearchPath, parent);
-        addConvertedDexPaths(dexPath);
         macapkOpenNow();
     }
 
-    /** buildUrls already added each path as a plain file: URL. For .dex/.apk
-     *  inputs that is not loadable as bytecode, so additionally append the
-     *  converted jar. (A class-file .jar is already usable via the
-     *  plain URL, so we skip converting those to avoid a wasted conversion.) */
-    private void addConvertedDexPaths(String dexPath) {
-        if (dexPath == null || dexPath.isEmpty()) return;
-        for (String p : dexPath.split(":")) {
-            if (p.isEmpty()) continue;
-            java.io.File f = new java.io.File(p);
-            if (!f.isFile()) continue;
-            String lower = p.toLowerCase();
-            if (lower.endsWith(".dex") || lower.endsWith(".apk")
-                    || lower.endsWith(".zip")) {
-                try {
-                    addURL(MacApkDexConverter.convertFileToJarUrl(f));
-                } catch (RuntimeException skip) {
-                    // unusable; surfaces lazily at findClass (AOSP-equivalent)
-                }
-            }
-        }
-    }
 }

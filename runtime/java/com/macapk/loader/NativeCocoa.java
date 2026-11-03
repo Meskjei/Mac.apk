@@ -13,6 +13,8 @@ public final class NativeCocoa {
      *  MACAPK_MAX_FPS (default 120). The SAME value paces the present loop and the guest drive
      *  cadence, so android.view.Display.getRefreshRate() must report this and nothing else. */
     /** Real window backing scale. Touch mapping hardcoded 2.0f, which is wrong on a 1x display. */
+    public static native boolean lockViewport();
+    public static native boolean viewportFixed();
     public static native float backingScale();
     /** HARNESS: post a real left-mouse NSEvent (0 down, 1 up, 2 dragged) into our own AppKit
      *  queue at a FRACTION of the window content, top-left origin, so an injected click crosses

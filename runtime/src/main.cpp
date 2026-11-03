@@ -2222,6 +2222,14 @@ int main(int argc, char** argv) {
     const long long main_entry_ms = NowEpochMs();   // BOOTSPEED clock: stub + dyld cost
     MacApkRunLockCloexec();
     CliArgs cli = ParseArgs(argc, argv);
+    // Automation owns a fixed phone device, not the largest portrait host window.
+    // Seed the canvas before Cocoa/JVM initialization; never resize an active device.
+    const char* fixed_viewport = std::getenv("MACAPK_FIXED_VIEWPORT");
+    if (fixed_viewport && std::strcmp(fixed_viewport, "1") == 0 && cli.width == 0 && cli.height == 0) {
+        cli.width = 390;
+        cli.height = 844;
+        cli.orient = Orient::PORTRAIT;
+    }
     // Engine-gate the pairip frontier surfaces: detect the native-VM pairip
     // marker ONCE here (pre-JVM, BEFORE the bionic shim is dlopen'd) and publish
     // it as MACAPK_PAIRIP_APP. The shim's __macapk_pairip_surface_on then lets a

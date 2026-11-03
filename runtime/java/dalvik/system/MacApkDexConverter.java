@@ -174,12 +174,21 @@ final class MacApkDexConverter {
 
     // ---- package-private conversion entry points ----
 
-    /** Convert a DEX/JAR/APK file at {@code input} into a .jar of JVM bytecode
-     *  and return its URL. The jar is a PERSISTENT cache entry when the data
-     *  dir and build identity are known and every class translated (see the
-     *  file header), so it exists by path for as long as a DexFile may need to
-     *  re-open it. Otherwise it is ephemeral, exactly like in-memory output.
-     *  Never returns null; throws on failure. */
+    /** Preserve JVM code paths and convert DEX-bearing paths for every loader. */
+    static URL executableUrl(File input) throws IOException {
+        if (input.isDirectory()) return input.toURI().toURL();
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(input)) {
+            if (zip.getEntry("classes.dex") == null
+                    && zip.stream().anyMatch(e -> e.getName().endsWith(".class")))
+                return input.toURI().toURL();
+        } catch (java.util.zip.ZipException rawDex) {
+            // ART also accepts raw DEX regardless of the file extension.
+        }
+        return convertFileToJarUrl(input);
+    }
+
+    /** Convert a DEX/JAR/APK into a persistent build-scoped cache entry, or an
+     *  ephemeral jar when app identity is unavailable. Never returns null. */
     static URL convertFileToJarUrl(File input) {
         List<byte[]> images;
         try {

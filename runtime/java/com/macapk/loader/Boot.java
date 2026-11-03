@@ -1252,7 +1252,10 @@ public final class Boot {
         // views of uname cannot disagree -- an invariant real Android gets for
         // free by having exactly one uname behind both.
         System.setProperty("os.version", "5.10.0");
-        System.setProperty("java.vm.name", "Dalvik");
+        // A host-TLS profile must let libraries select JSSE rather than
+        // Android Conscrypt socket classes that this runtime does not provide.
+        if (!"1".equals(System.getenv("MACAPK_HOST_VM_NAME")))
+            System.setProperty("java.vm.name", "Dalvik");
         System.setProperty("java.vendor", "The Android Project");
         System.setProperty("java.runtime.name", "Android Runtime");
         // The rest of the vendor/name set libcore documents as "always provided
@@ -1408,6 +1411,17 @@ public final class Boot {
             // create_unnamed_module. Generic; no per-APK code.
             forceClassLoaderDataInit(appCl);
             forceClassLoaderDataInit(ClassLoader.getSystemClassLoader());
+            // Optional real Android platform ELFs, in dependency order. Never stub a failed load.
+            String platformLibraries = System.getenv("MACAPK_SYSTEM_NATIVE_LIBS");
+            if (platformLibraries != null && !platformLibraries.isBlank()) {
+                for (String path : platformLibraries.split(java.util.regex.Pattern.quote(File.pathSeparator))) {
+                    File library = new File(path);
+                    if (!library.isAbsolute() || !library.isFile())
+                        throw new java.io.IOException("Missing platform native library: " + path);
+                    System.load(AppClassLoader.resolveNativeCodePath(appCl, library));
+                    NativeLog.i(TAG, "Loaded platform native library: " + library.getName());
+                }
+            }
         } catch (Throwable t) {
             NativeLog.e(TAG, "ClassLoader construction failed: " + t);
             return;
@@ -2117,6 +2131,7 @@ public final class Boot {
                     }
                     application = (Application) appClass.getDeclaredConstructor().newInstance();
                 }
+                android.app.ActivityThread.currentActivityThread().macapkPublishApplication(application);
                 application.macapkInit(manifest.packageName, filesDir, cacheDir, assets, resources);
                 application.macapkSetClassLoader(appCl);
                 // Wire up the JNI FindClass app-classloader fallback (see
@@ -2572,6 +2587,8 @@ public final class Boot {
         // start from ViewCanvasDriver.doFrame, which pure-GL apps never run, so
         // their replayed taps were never read. The driver itself waits for an
         // activity before consuming anything. See TouchDispatcher.
+        try { AutomationServer.start(application.getPackageName()); }
+        catch (Throwable t) { NativeLog.w(TAG, "automation unavailable: " + t.getClass().getSimpleName()); }
         try { TouchDispatcher.macapkStartInjectDriver(); }
         catch (Throwable t) { NativeLog.w(TAG, "inject driver: " + t); }
 
@@ -3619,7 +3636,7 @@ public final class Boot {
     private static volatile java.util.Map<String, String> sForeignProcess =
         java.util.Collections.emptyMap();
 
-    private static String foreignProcessFor(String className) {
+    public static String foreignProcessFor(String className) {
         java.util.Map<String, String> t = sForeignProcess;
         return (className == null || t.isEmpty()) ? null : t.get(className);
     }

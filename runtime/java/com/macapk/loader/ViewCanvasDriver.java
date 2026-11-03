@@ -96,6 +96,7 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
         // of this post), so the tree is measured under the Configuration and
         // DisplayMetrics that describe the size it is about to be given.
         DisplayConfig.commitPending();
+        TouchDispatcher.macapkNoteSurfaceSize(widthPx, heightPx);
         this.surfaceW = widthPx;
         this.surfaceH = heightPx;
         // Thread identity (v1.0.1636): the owner-only routing means this must

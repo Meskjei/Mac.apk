@@ -42,7 +42,13 @@ public final class ActivityThread {
      *  package name (mPackages); a Mac.apk process runs exactly one app, so one
      *  field is the whole map. */
     private LoadedApk mBoundLoadedApk;
-    private Application mInitialApplication;
+    private volatile Application mInitialApplication;
+
+    /** Publish the same Application for the legacy Boot construction path. */
+    public void macapkPublishApplication(Application application) {
+        if (application == null) throw new NullPointerException("application");
+        mInitialApplication = application;
+    }
 
     /** AOSP peekPackageInfo(String, boolean). Instrumentation.getFactory calls
      *  this to find the LoadedApk whose declared appComponentFactory should

@@ -251,6 +251,10 @@ public class InputMethodManager {
     public static void macapkOnViewFocusChanged(View view, boolean gainFocus) {
         if (view == null) return;
         if (gainFocus) {
+            // Follow focus while soft input is active (e.g. one-character OTP
+            // fields). Keeping the old TextView routes every later key to it.
+            if (view != sHideSuppressed && (sSoftInputShown || sActiveInput != null))
+                macapkSetActiveInput(safeIsEditor(view) ? view : null);
             if (view != sServedView) INSTANCE.macapkStartInput(view, false);
         } else if (view == sServedView) {
             // AOSP focusOut does NOT finish input immediately (another view in
@@ -258,6 +262,7 @@ public class InputMethodManager {
             // next checkFocus re-target. Clearing the connection here is safe
             // and simpler, and the next query re-binds whatever now has focus.
             sServedView = null; sActiveConnection = null; sCurrentEditorInfo = null;
+            if (sActiveInput == view) sActiveInput = null;
         }
     }
 
@@ -366,6 +371,14 @@ public class InputMethodManager {
     /** The bound InputConnection for the focused editor, or null. Validated
      *  against the served view still being attached so stale connections from a
      *  dismissed field don't keep swallowing keys. */
+    /** The editor belonging to the current IME connection, not a previous soft-input view. */
+    public static android.widget.TextView macapkServedEditor() {
+        macapkCheckFocus();
+        View view = servedViewOrNull();
+        return view instanceof android.widget.TextView && view.onCheckIsTextEditor()
+                ? (android.widget.TextView) view : null;
+    }
+
     public static android.view.inputmethod.InputConnection macapkActiveConnection() {
         // AOSP's own pattern: every public query re-syncs the served view
         // against the focused view first (isAcceptingText -> checkFocus). This

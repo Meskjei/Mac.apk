@@ -7,6 +7,7 @@ package com.macapk.loader;
 
 public final class NativeOs {
     private NativeOs() {}
+    public static native int  chmod(String path, int mode);             // 0, else -bionic errno
     public static native int  open(String path, int flags, int mode);   // new fd, else -errno (flags = bionic O_*)
     public static native long lseek(int fd, long offset, int whence);   // >=0 offset, else -errno
     public static native int  close(int fd);                            // 0, else -errno

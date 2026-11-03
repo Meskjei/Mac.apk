@@ -1100,7 +1100,7 @@ private:
     // protections (eh_frame final) and before run_init_array (constructors may
     // throw). MACAPK_NO_EH_REGISTER=1 disables.
     void register_eh_frames();
-    bool apply_segment_protections();
+    bool apply_segment_protections(bool seal_relro = true);
     // 16 KiB-host-page W^X reconciliation for 4 KiB-aligned Android ELFs.
     // has_wx_conflict() models apply_segment_protections()'s page union for a
     // candidate bias shift; choose_rx_rw_bias_shift() returns how far to push
@@ -1144,6 +1144,8 @@ static bool macapk_unity_swappy_present_retired();
 // registry of previously-loaded Images. Body lives near the public-
 // ABI block where the registry actually gets appended to.
 std::vector<Image*>& loaded_images();
+void guest_debug_add(Image*);
+void guest_debug_remove(Image*);
 // Guest dladdr's dli_fname for an image (defined with __macapk_arm64_native_dladdr);
 // load_common() interns it into Image::dladdr_fname before registering the image.
 static const char* macapk_guest_image_realpath(const Image* img);
@@ -2798,6 +2800,20 @@ void* Image::resolve_external(const std::string& name, uint8_t bind) {
         if (void* p = __macapk_guest_vulkan_symbol(name.c_str())) return p;
     }
 
+    // Android's platform libc++ also uses std::__1, but its mutex/condition
+    // objects contain Bionic pthread structs. Bind methods to the declared
+    // guest provider before Darwin's same-named methods; keep __cxa/_Unwind host-owned.
+    if (name.rfind("_ZN", 0) == 0 && name.find("St3__1") != std::string::npos
+            && std::find(needed_.begin(), needed_.end(), "libc++.so") != needed_.end()) {
+        for (Image* image : loaded_images()) {
+            if (image == this || !image->name()) continue;
+            const char* slash = std::strrchr(image->name(), '/');
+            const char* soname = slash ? slash + 1 : image->name();
+            if (std::strcmp(soname, "libc++.so") == 0)
+                if (void* symbol = image->lookup(name.c_str())) return symbol;
+        }
+    }
+
     // Then any host-process symbol (libSystem libc/libm/libpthread,
     // libc++, ANGLE, the shim's directly-exported Bionic names like
     // AAssetManager_*). dlsym(RTLD_DEFAULT) walks every loaded dylib.
@@ -4320,7 +4336,7 @@ size_t Image::choose_rx_rw_bias_shift(
     return shift;
 }
 
-bool Image::apply_segment_protections() {
+bool Image::apply_segment_protections(bool seal_relro) {
     // Find PT_GNU_RELRO so we can drop W from segment 2 (.data.rel.ro,
     // .init_array, .got, etc.) post-relocation. The Android .so layout
     // typically places the RELRO region right after .text/.plt; without
@@ -4331,7 +4347,7 @@ bool Image::apply_segment_protections() {
     // the conflict on every well-formed ELF.
     uintptr_t relro_lo = 0, relro_hi = 0;
     for (const auto& ph : phdrs_) {
-        if (ph.p_type != PT_GNU_RELRO) continue;
+        if (ph.p_type != PT_GNU_RELRO || !seal_relro) continue;
         relro_lo = uintptr_t(base_) + ph.p_vaddr;
         relro_hi = relro_lo + ph.p_memsz;
         break;
@@ -4444,22 +4460,6 @@ bool Image::apply_segment_protections() {
             (unsigned long long)(w_lo - uintptr_t(base_)),
             (unsigned long long)(w_hi - uintptr_t(base_)),
             (unsigned long long)(w_hi > w_lo ? w_hi - w_lo : 0));
-        // An R_AARCH64_IRELATIVE slot is written by
-        // apply_ifunc_relocations() AFTER this pass, so a deferred slot
-        // inside a page we are about to freeze would fault on store. None
-        // of the known-affected libraries emit IRELATIVE (verified: 0 in
-        // every libcrashlytics*/libFirebaseCpp* in the corpus), but name
-        // the hazard rather than let it surface as a mystery SIGBUS.
-        for (const auto& d : deferred_ifunc_) {
-            uintptr_t slot = reinterpret_cast<uintptr_t>(d.second);
-            if (slot >= page_lo && slot < page_lo + page_size_
-                && !rwx_drop_exec) {
-                std::fprintf(stderr,
-                    "[arm64-native] %s: WARNING deferred IRELATIVE slot %p "
-                    "lies in a page losing W; its resolver store will "
-                    "fault.\n", dbg_name_, (void*)slot);
-            }
-        }
         if (rwx_drop_exec) prot &= ~PROT_EXEC;
         else               prot &= ~PROT_WRITE;
     }
@@ -4470,6 +4470,21 @@ bool Image::apply_segment_protections() {
             dbg_name_, rwx_pages, rwx_bytes,
             (unsigned long long)(rwx_first - uintptr_t(base_)),
             (unsigned long long)(rwx_last - uintptr_t(base_)));
+    }
+
+    if (!seal_relro) {
+        for (const auto& deferred : deferred_ifunc_) {
+            uintptr_t slot = reinterpret_cast<uintptr_t>(deferred.second);
+            for (uintptr_t at : {slot, slot + sizeof(uint64_t) - 1}) {
+                auto page = page_prot.find(align_down(at, page_size_));
+                if (page == page_prot.end() || !(page->second & PROT_WRITE)) {
+                    std::fprintf(stderr, "[arm64-native] %s: IRELATIVE slot %p "
+                        "cannot remain writable while preserving segment permissions and W^X.\n",
+                        dbg_name_, reinterpret_cast<void*>(slot));
+                    return false;
+                }
+            }
+        }
     }
 
     // Coalesce adjacent same-prot pages into single mprotect calls
@@ -4502,8 +4517,9 @@ bool Image::apply_segment_protections() {
 void Image::apply_ifunc_relocations() {
     // Run the R_AARCH64_IRELATIVE resolvers recorded during
     // apply_relocations(). MUST be called after
-    // apply_segment_protections() has flipped the executable PT_LOADs to
-    // RX: the resolver is guest .text and is non-executable until then.
+    // apply_segment_protections(false) has flipped executable PT_LOADs to
+    // RX while keeping RELRO data writable. RELRO is sealed after all
+    // resolver results have been stored, matching the Android linker order.
     //
     // Semantics (Bionic linker_relocate.cpp R_GENERIC_IRELATIVE):
     //   result = resolver();   // resolver() takes no args, returns addr
@@ -5569,7 +5585,7 @@ bool Image::load_common() {
         }
     }
     lap("trampoline/x18 finalize + icache");
-    if (!apply_segment_protections())         return false;
+    if (!apply_segment_protections(deferred_ifunc_.empty())) return false;
     // Strip X from each syscall-wrapper guard page NOW -- after protections, so they are not
     // re-flipped to R-X. Bytes stay pristine (any .text self-hash passes); exec-faults route
     // through macapk_syscall_guard_fault. No-op unless macapk_setup_syscall_guard_page armed one
@@ -6193,15 +6209,14 @@ bool Image::load_common() {
     //   3. The /proc/self/maps synthesizer: libs that locate themselves by
     //      parsing maps during init (metasec-class) see themselves, as on
     //      real Android.
-    // Safe: every load-failure `return false` in load_common() precedes this
-    // line, and nothing after it can fail, so the entry points' failure
-    // paths never see a registered half-loaded image (they also
-    // defensively unregister -- see unregister_image()). Mutation is
+    // A later RELRO-sealing failure is cleaned up by the entry points'
+    // defensive unregister_image() path. Mutation is
     // serialized by dyld's dlopen lock, same as the old push site.
     lap("apply_segment_protections");
     // dladdr's name first, so no reader can see this image without one.
     dladdr_fname.store(macapk_guest_image_realpath(this), std::memory_order_release);
     loaded_images().push_back(this);
+    guest_debug_add(this);
 
     // Register .eh_frame FDEs with the host unwinder so guest C++ exceptions
     // unwind across host frames (item 4). After protections (eh_frame final),
@@ -6215,6 +6230,7 @@ bool Image::load_common() {
     // ifunc-backed libc routines). See deferred_ifunc_ for the rationale.
     lap("register_eh_frames");
     apply_ifunc_relocations();
+    if (!deferred_ifunc_.empty() && !apply_segment_protections()) return false;
 
     // ===== arm64 x18-trap mitigation: keep writable segments resident =====
     // (page-out variant of the geomfill/arena prefault family; shipped,
@@ -11792,7 +11808,7 @@ size_t Image::apply_midr_el1_neutralization() {
 // The plan lives next to the x18 plans (.x18cache/<soname>.canaryplan), so every
 // tool that clears those (boottime --force-cold, ab_clear_code) clears it too.
 static constexpr uint32_t kCanaryPlanMagic   = 0x31504E43u;  // 'CNP1'
-static constexpr uint32_t kCanaryPlanVersion = 1;
+static constexpr uint32_t kCanaryPlanVersion = 2;
 
 // This dylib's LC_UUID -- the identity of the pass's own code.
 static bool macapk_shim_uuid(uint8_t out[16]) {
@@ -14198,6 +14214,140 @@ std::vector<Image*>& loaded_images() {
     return v;
 }
 
+// A guest ELF ABI view of this Mach-O host's loader, followed only by real guest
+// images. No Android executable or system library is impersonated here.
+struct GuestLinkMap {
+    uintptr_t address;
+    const char* name;
+    const void* dynamic;
+    GuestLinkMap* next;
+    GuestLinkMap* previous;
+};
+struct GuestRDebug {
+    int version = 1;
+    std::atomic<GuestLinkMap*> map{nullptr};
+    uintptr_t breakpoint;
+    int state = 0; // RT_CONSISTENT: readers see immutable, complete snapshots.
+    uintptr_t linker_base = 0;
+};
+static_assert(offsetof(GuestRDebug, map) == 8 && offsetof(GuestRDebug, state) == 24);
+static_assert(sizeof(GuestLinkMap) == 40);
+
+bool guest_link_map_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MACAPK_GUEST_LINK_MAP");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+__attribute__((noinline)) void guest_link_map_changed() { asm volatile(""); }
+
+class GuestLoaderDebug {
+    struct MainView {
+        Elf64_Ehdr header{};
+        Elf64_Phdr phdrs[3]{};
+        Elf64_Dyn dynamic[2]{};
+    } main_;
+    struct Module { Image* key; uintptr_t base; std::string name; const void* dynamic; };
+    struct Snapshot { std::unique_ptr<GuestLinkMap[]> nodes; std::vector<std::string> names; };
+    GuestRDebug debug_{};
+    std::mutex mutex_;
+    std::vector<Module> modules_;
+    // Guest dlclose currently pins images. Keep old enumeration nodes pinned too.
+    std::vector<std::unique_ptr<Snapshot>> snapshots_;
+    bool exposed_ = false;
+
+    void publish() {
+        auto snapshot = std::make_unique<Snapshot>();
+        const size_t count = modules_.size() + 1;
+        snapshot->nodes = std::make_unique<GuestLinkMap[]>(count);
+        snapshot->names.reserve(count);
+        snapshot->names.emplace_back("[macapk-guest-loader]");
+        for (const auto& module : modules_) snapshot->names.push_back(module.name);
+        for (size_t i = 0; i < count; ++i) {
+            snapshot->nodes[i] = {
+                i ? modules_[i - 1].base : reinterpret_cast<uintptr_t>(&main_),
+                snapshot->names[i].c_str(),
+                i ? modules_[i - 1].dynamic : main_.dynamic,
+                i + 1 < count ? &snapshot->nodes[i + 1] : nullptr,
+                i ? &snapshot->nodes[i - 1] : nullptr,
+            };
+        }
+        GuestLinkMap* head = snapshot->nodes.get();
+        snapshots_.push_back(std::move(snapshot));
+        debug_.map.store(head, std::memory_order_release);
+        guest_link_map_changed();
+    }
+public:
+    GuestLoaderDebug() {
+        auto& header = main_.header;
+        const unsigned char ident[] = {0x7f, 'E', 'L', 'F', 2, 1, 1};
+        std::memcpy(header.e_ident, ident, sizeof(ident));
+        header.e_type = 3; // ET_DYN; metadata for the guest loader, not app_process.
+        header.e_machine = 183; // EM_AARCH64
+        header.e_version = 1;
+        header.e_phoff = offsetof(MainView, phdrs);
+        header.e_ehsize = sizeof(Elf64_Ehdr);
+        header.e_phentsize = sizeof(Elf64_Phdr);
+        header.e_phnum = 3;
+        main_.phdrs[0] = {6, PF_R, offsetof(MainView, phdrs), offsetof(MainView, phdrs), 0,
+                          sizeof(main_.phdrs), sizeof(main_.phdrs), 8}; // PT_PHDR
+        main_.phdrs[1] = {PT_DYNAMIC, PF_R, offsetof(MainView, dynamic), offsetof(MainView, dynamic), 0,
+                          sizeof(main_.dynamic), sizeof(main_.dynamic), 8};
+        main_.phdrs[2] = {PT_LOAD, PF_R, 0, 0, 0, sizeof(main_), sizeof(main_), 8};
+        main_.dynamic[0] = {21, reinterpret_cast<uintptr_t>(&debug_)}; // DT_DEBUG
+        debug_.breakpoint = reinterpret_cast<uintptr_t>(&guest_link_map_changed);
+    }
+    unsigned long auxv(unsigned long type) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!exposed_) { publish(); exposed_ = true; }
+        if (type == 3) return reinterpret_cast<unsigned long>(main_.phdrs);
+        if (type == 4) return sizeof(Elf64_Phdr);
+        if (type == 5) return main_.header.e_phnum;
+        return 0;
+    }
+    void set(Image* image, uintptr_t base, const char* name, const void* dynamic) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& module : modules_) if (module.key == image) {
+            if (module.base == base && module.name == name && module.dynamic == dynamic) return;
+            module = {image, base, name, dynamic};
+            if (exposed_) publish();
+            return;
+        }
+        modules_.push_back({image, base, name, dynamic});
+        if (exposed_) publish();
+    }
+    void remove(Image* image) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto at = std::find_if(modules_.begin(), modules_.end(),
+                               [=](const Module& module) { return module.key == image; });
+        if (at == modules_.end()) return;
+        modules_.erase(at);
+        if (exposed_) publish();
+    }
+};
+GuestLoaderDebug& guest_loader_debug() {
+    static auto* state = new GuestLoaderDebug();
+    return *state;
+}
+void guest_debug_add(Image* image) {
+    if (!guest_link_map_enabled()) return;
+    for (size_t i = 0; i < image->phdr_count(); ++i) {
+        const auto& header = image->phdrs_data()[i];
+        if (header.p_type == PT_DYNAMIC && header.p_memsz >= sizeof(Elf64_Dyn)
+                && header.p_vaddr <= image->mapped_size()
+                && header.p_memsz <= image->mapped_size() - header.p_vaddr) {
+            guest_loader_debug().set(image, reinterpret_cast<uintptr_t>(image->base()),
+                image->dladdr_fname.load(std::memory_order_acquire), image->base() + header.p_vaddr);
+            return;
+        }
+    }
+}
+void guest_debug_remove(Image* image) {
+    if (guest_link_map_enabled()) guest_loader_debug().remove(image);
+}
+
 // Is any arm64 GUEST image loaded? The only honest ABI discriminator available to
 // bionic_shim.cpp, which needs it to emit /proc/self/auxv at the right entry WIDTH: an arm64
 // guest parses 64-bit (type,val) pairs, an ARM32 one parses 32-bit. Returns 0 before the first
@@ -14417,8 +14567,10 @@ extern "C" void __macapk_set_guest_lib_dir(const char* dir) {
     // not on the dladdr path (see Image::dladdr_fname). The old strings stay valid:
     // the intern table never frees, so a pointer a guest already holds keeps working.
     for (Image* im : loaded_images())
-        if (im) im->dladdr_fname.store(macapk_guest_image_realpath(im),
-                                       std::memory_order_release);
+        if (im) {
+            im->dladdr_fname.store(macapk_guest_image_realpath(im), std::memory_order_release);
+            guest_debug_add(im);
+        }
     std::fprintf(stderr,
         "[arm64-native] guest libraries will be reported in /proc/self/maps under "
         "%s (pushed by the Java side, so maps and ApplicationInfo."
@@ -14481,6 +14633,25 @@ static const char* macapk_guest_image_realpath(const Image* img) {
     std::string nm = (img && img->name()) ? img->name() : "lib.so";
     size_t slash = nm.find_last_of('/');
     std::string bn = (slash == std::string::npos) ? nm : nm.substr(slash + 1);
+    // Explicit platform preloads are real files outside the app install directory.
+    static const std::vector<std::string> platform_paths = [] {
+        std::vector<std::string> paths;
+        const char* value = std::getenv("MACAPK_SYSTEM_NATIVE_LIBS");
+        if (!value) return paths;
+        std::string list(value);
+        size_t start = 0;
+        while (start < list.size()) {
+            size_t end = list.find(':', start);
+            paths.push_back(list.substr(start, end == std::string::npos ? end : end - start));
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        return paths;
+    }();
+    for (const auto& path : platform_paths) {
+        size_t at = path.find_last_of('/');
+        if (at != std::string::npos && path.substr(at + 1) == bn) return path.c_str();
+    }
     if (bn.size() > 6 && bn.compare(bn.size() - 6, 6, ".dylib") == 0)
         bn = bn.substr(0, bn.size() - 6) + ".so";
     const std::string path = macapk_guest_lib_dir() + bn;
@@ -14873,6 +15044,7 @@ void macapk_write_guest_only_maps(FILE* f) {
 // failure path added AFTER guest code first runs cannot leave the registry
 // holding a dangling pointer that the SEGV handler would then walk.
 static void unregister_image(Image* img) {
+    guest_debug_remove(img);
     auto& v = loaded_images();
     for (auto it = v.begin(); it != v.end(); ++it) {
         if (*it == img) { v.erase(it); break; }
@@ -14884,6 +15056,10 @@ static void unregister_image(Image* img) {
 // --- Public ABI -- linked into libmacapk-bionic-shim.dylib ------------
 
 extern "C" {
+
+unsigned long __macapk_arm64_native_auxv(unsigned long type) {
+    return guest_link_map_enabled() ? guest_loader_debug().auxv(type) : 0;
+}
 
 // Load an arm64 Android ELF blob into memory. Returns an opaque handle
 // on success, nullptr on failure (with stderr diagnostic).
@@ -15195,6 +15371,11 @@ int __macapk_arm64_native_iterate_phdr(
     for (auto* img : loaded_images()) {
         if (!img || !img->base()) continue;
         const char* nm = img->name();
+        if (const char* source = img->dladdr_fname.load(std::memory_order_acquire)) {
+            // Platform files must have the same identity in dladdr and the PHDR walk.
+            if (std::getenv("MACAPK_SYSTEM_NATIVE_LIBS") && std::strchr(source, '/')
+                    && std::strstr(source, "/data/app/") == nullptr) nm = source;
+        }
         std::string anm;
         if (relabel && nm && *nm) { anm = macapk_maps_android_path(nm); nm = anm.c_str(); }
         int r = cb(img->base(), img->phdrs_data(),

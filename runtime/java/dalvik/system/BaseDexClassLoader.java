@@ -12,18 +12,18 @@
 package dalvik.system;
 
 import java.io.File;
-import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 
 public class BaseDexClassLoader extends URLClassLoader {
+    private final String nativeLibrarySearchPath;
 
-    /** AOSP signature. dexPath is a colon-separated list of code paths;
-     *  optimizedDirectory + librarySearchPath are advisory on a real device
-     *  and ignored here. */
+    /** AOSP signature. Code paths are converted and native search paths retained;
+     *  optimizedDirectory is advisory. */
     public BaseDexClassLoader(String dexPath, File optimizedDirectory,
                               String librarySearchPath, ClassLoader parent) {
         super(buildUrls(dexPath), parent);
+        nativeLibrarySearchPath = librarySearchPath == null ? "" : librarySearchPath;
         // ART searches a loader's JNI libraries in path-sorted order; see
         // ArtJniLibraryOrder. Before anything can load through this loader.
         ArtJniLibraryOrder.apply(this);
@@ -33,6 +33,7 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  (AppClassLoader, the no-dex DexClassLoader path). */
     protected BaseDexClassLoader(URL[] urls, ClassLoader parent) {
         super(urls, parent);
+        nativeLibrarySearchPath = "";
         ArtJniLibraryOrder.apply(this);
     }
 
@@ -130,7 +131,14 @@ public class BaseDexClassLoader extends URLClassLoader {
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
-        return super.findClass(binaryName(name));
+        String bn = binaryName(name);
+        // ART's DexFile DefineClass returns an existing definition. Custom
+        // child-first loaders may call findClass repeatedly, including during
+        // JNI_OnLoad. URLClassLoader otherwise attempts a duplicate definition.
+        synchronized (getClassLoadingLock(bn)) {
+            Class<?> loaded = findLoadedClass(bn);
+            return loaded != null ? loaded : super.findClass(bn);
+        }
     }
 
     /** DexFile.loadClass(name, loader) entry point: define {@code binaryName}
@@ -160,11 +168,9 @@ public class BaseDexClassLoader extends URLClassLoader {
         return name != null && name.indexOf('/') >= 0 ? name.replace('/', '.') : name;
     }
 
-    /** AOSP exposes the library search path; native-lib loaders read it. We
-     *  have no Android ld.so search path, so report empty (callers fall back
-     *  to ClassLoader.findLibrary, which our AppClassLoader implements). */
+    /** AOSP exposes the configured native-library search path. */
     public String getLdLibraryPath() {
-        return "";
+        return nativeLibrarySearchPath;
     }
 
     /** AOSP (hidden API): adds a new code path to this loader's DexPathList at
@@ -190,16 +196,11 @@ public class BaseDexClassLoader extends URLClassLoader {
             File f = new File(p);
             if (!f.isFile()) continue;
             try {
-                // Real .dex / .apk / .jar code paths need DEX->bytecode; a
-                // plain .jar of class files would also survive conversion (it
-                // tolerates non-dex archives by emitting nothing useful), so we
-                // first try direct-as-jar for .jar inputs and fall back to
-                // conversion. URLClassLoader.addURL is protected; we are the
-                // subclass, so we can call it.
-                URL converted = MacApkDexConverter.convertFileToJarUrl(f);
+                // Use the same format detection as constructor-supplied paths.
+                URL converted = MacApkDexConverter.executableUrl(f);
                 addURL(converted);
                 added = true;
-            } catch (RuntimeException e) {
+            } catch (java.io.IOException | RuntimeException e) {
                 // Lazy surface: leave the path unusable. findClass throws
                 // ClassNotFoundException for its classes, which is what the
                 // on-device "unusable dex element" case also produces.
@@ -271,10 +272,16 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  so the app dex's invokevirtual resolves against THIS class; without a
      *  public declaration here resolution lands on the protected
      *  java.lang.ClassLoader.findLibrary and the JVM throws
-     *  IllegalAccessError (Smash Hit died in onCreate this way). The base
-     *  implementation has no library knowledge -- AppClassLoader overrides
-     *  with the real translate-and-cache lookup. */
+     *  IllegalAccessError (Smash Hit died in onCreate this way). Dynamic
+     *  loaders use their native search path and the app's translation cache. */
     public String findLibrary(String name) {
+        if (name == null || name.indexOf('/') >= 0 || name.indexOf('\\') >= 0) return null;
+        for (String dir : nativeLibrarySearchPath.split(File.pathSeparator)) {
+            if (dir.isEmpty()) continue;
+            File source = new File(dir, "lib" + name + ".so");
+            if (source.isFile())
+                return com.macapk.loader.AppClassLoader.resolveNativeCodePath(this, source);
+        }
         return null;
     }
 
@@ -328,9 +335,13 @@ public class BaseDexClassLoader extends URLClassLoader {
         URL[] urls = new URL[parts.length];
         int n = 0;
         for (String p : parts) {
+            if (p.isEmpty()) continue;
+            File input = new File(p);
+            if (!input.exists()) continue;
             try {
-                urls[n++] = new File(p).toURI().toURL();
-            } catch (MalformedURLException e) {
+                URL executable = MacApkDexConverter.executableUrl(input);
+                urls[n++] = executable;
+            } catch (java.io.IOException | RuntimeException e) {
                 // AOSP skips unusable paths, surfacing errors lazily at findClass.
             }
         }

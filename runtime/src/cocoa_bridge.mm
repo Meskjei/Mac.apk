@@ -47,6 +47,8 @@
 #include <cstring>         // std::strcmp / std::memcpy
 #include <map>             // window policy phase 3: remembered boxes by activity token
 #include "macapk/self_capture.h"
+#include "macapk/pending_layer_captures.h"
+#include "macapk/opaque_pixels.h"
 #include "macapk/app_process_group.h"   // AOSP killProcessGroup on app death (macapk_terminate_now)
 #include <libproc.h>        // proc_pidpath -- the app-owned fork test in macapk_terminate_now
 #include <signal.h>         // SIGKILL
@@ -144,6 +146,16 @@ NSApplication* g_app           = nil;
 std::atomic<bool> g_initialized{false};
 int g_phone_w = 360;
 int g_phone_h = 640;
+// Automation owns a device canvas; desktop resizes must not redefine its display.
+static bool fixed_viewport_requested() {
+    static const bool fixed = [] { const char *v = std::getenv("MACAPK_FIXED_VIEWPORT"); return v && std::strcmp(v, "1") == 0; }();
+    return fixed;
+}
+static bool g_viewport_locked = false;
+static NSSize g_viewport_content_size = NSZeroSize;
+static int g_viewport_phone_w = 0, g_viewport_phone_h = 0;
+static CGFloat g_viewport_backing_scale = 0;
+
 // Set true once an explicit launcher/CLI size pinned the canvas (via
 // CocoaSetPhoneSize). A subsequent runtime Activity.setRequestedOrientation
 // then only TRANSPOSES that pinned size to the requested side instead of
@@ -2419,17 +2431,21 @@ static NSRect MacApkAspectFitRect(NSSize cs, CGFloat aspectW, CGFloat aspectH) {
 // the declarations in the header without opening it again.
 // ---------------------------------------------------------------------------
 
+static const char* MacapkCaptureDirectory() {
+    const char* dir = std::getenv("MACAPK_CAPTURE_DIR");
+    return dir && dir[0] == '/' ? dir : "/tmp";
+}
 static void MacapkCaptureReqPath(char* req, size_t reqn) {
-    std::snprintf(req, reqn, "/tmp/macapk_capture_req_%d", (int)getpid());
+    std::snprintf(req, reqn, "%s/macapk_capture_req_%d", MacapkCaptureDirectory(), (int)getpid());
 }
 static void MacapkCaptureOutPath(char* out, size_t outn, const char* tag) {
-    std::snprintf(out, outn, "/tmp/macapk_capture_%d_%s.png", (int)getpid(),
+    std::snprintf(out, outn, "%s/macapk_capture_%d_%s.png", MacapkCaptureDirectory(), (int)getpid(),
                   tag ? tag : "gl");
 }
 // Completion marker. See the comment on SelfCaptureRequested for why a reader
 // cannot safely decide on its own that every source has written.
 static void MacapkCaptureDonePath(char* out, size_t outn) {
-    std::snprintf(out, outn, "/tmp/macapk_capture_%d.done", (int)getpid());
+    std::snprintf(out, outn, "%s/macapk_capture_%d.done", MacapkCaptureDirectory(), (int)getpid());
 }
 // Bit per capture source, so each one fires at most once per request window.
 static uint32_t MacapkCaptureBit(const char* tag) {
@@ -2460,6 +2476,17 @@ static bool MacapkSelfCaptureEnabled() {
     return enabled;
 }
 
+// Automation asks for what is already presented, rather than waiting for every
+// renderer to produce another frame. Legacy diagnostic requests stay unchanged.
+static bool MacapkCurrentCompositeRequested(const char* req) {
+    char mode[32] = {};
+    FILE* f = std::fopen(req, "r");
+    if (!f) return false;
+    const size_t n = std::fread(mode, 1, sizeof(mode) - 1, f);
+    std::fclose(f);
+    return n == 20 && std::memcmp(mode, "composite-current-v1", 20) == 0;
+}
+
 bool SelfCaptureGlWanted() {
     if (!MacapkSelfCaptureEnabled()) return false;
     if (g_cap_window_live.load(std::memory_order_acquire)) {
@@ -2474,7 +2501,7 @@ bool SelfCaptureGlWanted() {
     char req[PATH_MAX];
     MacapkCaptureReqPath(req, sizeof(req));
     struct stat st;
-    return stat(req, &st) == 0;
+    return stat(req, &st) == 0 && !MacapkCurrentCompositeRequested(req);
 }
 
 bool SelfCaptureRequested(const char* tag) {
@@ -2546,7 +2573,7 @@ bool SelfCaptureRequested(const char* tag) {
         char req[PATH_MAX];
         MacapkCaptureReqPath(req, sizeof(req));
         struct stat st;
-        if (stat(req, &st) != 0) return false;
+        if (stat(req, &st) != 0 || MacapkCurrentCompositeRequested(req)) return false;
         ::unlink(req);                 // single-shot: consume the request
         // Drop the previous window's marker before opening this one, so a
         // reader cannot mistake a stale .done for this request's completion.
@@ -2880,33 +2907,18 @@ static bool MacapkLayerCaptureEnabled() {
 // SIGSEGV in objc_msgSend (caught here on the first Frozen Bubble run). Hold it
 // as an explicitly +1-retained CFTypeRef, the same convention the
 // bounded-nextDrawable NDHandoff above uses for the same reason.
-// TWO slots, because a native-EGL app HAS two CAMetalLayers and they carry
-// different things: the guest's dedicated presentation layer (g_unity_layer,
-// created by CocoaEnsureNativeEglLayer / the Unity pre-create path) and the
-// framework's own angleLayer underneath it. A single slot let whichever layer
-// vended first win the race, so the capture could not say WHICH surface it had
-// read -- and that distinction IS the render-vs-composite bisect this instrument
-// exists to answer. So the tag is chosen by identity, not by arrival order:
-//   "layer"  = the guest's dedicated native-EGL layer when one exists
-//              (otherwise: whatever single layer the app presents through)
-//   "layer2" = any other CAMetalLayer, i.e. normally the framework's angleLayer
-// More than two layers is not a case this tree produces; extras are ignored
-// rather than silently overwriting a slot.
+// Pending drawables are keyed by live layer identity, not permanent slots:
+// activity/window transitions can create more than two layers in one process.
+// Entries leave the map when acquired again or flushed by the idle poll.
 static std::mutex          g_layercap_mu;
-static CFTypeRef           g_layercap_pending[2] = {nullptr, nullptr};  // +1 drawables
-static void*               g_layercap_slot_layer[2] = {nullptr, nullptr};  // identity only
+static PendingLayerCaptures g_layercap_pending;
+static std::mutex          g_layercap_readback_mu;
 static id<MTLDevice>       g_layercap_dev  = nil;         // +1 (CFRetain'd)
 static id<MTLCommandQueue> g_layercap_q    = nil;         // +1 (new... )
 static id<MTLTexture>      g_layercap_dst  = nil;         // +1 (new... )
 static std::vector<uint8_t> g_layercap_buf;
 
-// The TAG is derived from identity every time, NOT from the slot index. Slots
-// only answer "which pending drawable belongs to which layer"; naming is a
-// separate question, and tying it to slot order got it wrong for the common case:
-// a pure-framework app has no dedicated layer at all, and a rule of "slot 0 is
-// the dedicated one" pushed its ONLY layer into slot 1 and reported it as
-// `layer2` with no `layer` anywhere. Deriving the tag from identity also handles
-// the guest layer being created after the framework one has already vended.
+// Tags describe the layer's role, independent of pending-readback order.
 // v1.0.837: g_unity_layer is the DEDICATED native-EGL/Vulkan layer and is nil on the
 // ANGLE-Metal path, so keying only on it tagged EVERY layer "layer" for an ANGLE-Metal
 // guest -- including the framework's own angleLayer, which composites nothing but our
@@ -2924,18 +2936,7 @@ static const char* MacapkLayerTagFor(CAMetalLayer* layer) {
     return "layer";                             // guest layer, or a single-layer app
 }
 
-// Which pending slot a layer owns, first-come. Call under g_layercap_mu.
-// -1 = a third layer, which this tree does not produce; ignore it rather than
-// stomping a slot that belongs to someone else.
-static int MacapkLayerSlotFor(CAMetalLayer* layer) {
-    void* key = (void*)layer;
-    for (int i = 0; i < 2; ++i) if (g_layercap_slot_layer[i] == key) return i;
-    for (int i = 0; i < 2; ++i)
-        if (!g_layercap_slot_layer[i]) { g_layercap_slot_layer[i] = key; return i; }
-    return -1;
-}
-
-// Give a slot back so a failure never holds the .done marker hostage (the reader
+// Complete a failed readback so it never holds the .done marker hostage (the reader
 // would otherwise sit out its whole timeout for nothing).
 static void MacapkLayerCaptureAbandon(const char* tag) {
     g_cap_completed.fetch_or(MacapkCaptureBit(tag), std::memory_order_acq_rel);
@@ -2966,6 +2967,32 @@ static std::mutex        g_lpix_mu;
 static MacapkLayerPixels g_lpix[4];
 static uint64_t          g_lpix_seq = 0;
 
+// Retain the latest vended drawable as well as copied pixels. An idle guest
+// can stop presenting before a screenshot request arrives; waiting for its
+// next acquire would then keep an old capture forever. The bounded cache
+// retains at most one drawable per layer and never dereferences layer keys.
+struct MacapkLatestDrawable {
+    void* layer = nullptr;
+    CFTypeRef drawable = nullptr;
+    uint64_t seq = 0;
+};
+static std::mutex g_latest_drawable_mu;
+static MacapkLatestDrawable g_latest_drawables[4];
+static uint64_t g_latest_drawable_seq = 0;
+static void MacapkRememberDrawable(void* layer, id<CAMetalDrawable> drawable) {
+    std::lock_guard<std::mutex> lk(g_latest_drawable_mu);
+    MacapkLatestDrawable* dst = nullptr;
+    for (auto& e : g_latest_drawables) if (e.layer == layer) { dst = &e; break; }
+    if (!dst) for (auto& e : g_latest_drawables) if (!e.layer) { dst = &e; break; }
+    if (!dst) {
+        dst = &g_latest_drawables[0];
+        for (auto& e : g_latest_drawables) if (e.seq < dst->seq) dst = &e;
+    }
+    CFTypeRef held = CFRetain((CFTypeRef)drawable);
+    if (dst->drawable) CFRelease(dst->drawable);
+    *dst = { layer, held, ++g_latest_drawable_seq };
+}
+
 static void MacapkStoreLayerPixels(void* layerKey, const uint8_t* rgba,
                                    int w, int h) {
     if (!layerKey || !rgba || w <= 0 || h <= 0) return;
@@ -2987,9 +3014,11 @@ static void MacapkStoreLayerPixels(void* layerKey, const uint8_t* rgba,
 // the PNG. Takes ownership of the +1 reference. Runs on whatever thread finishes
 // the capture -- the guest's render thread or the main thread -- never on a CA
 // callback thread.
-static void MacapkLayerCaptureFinish(CFTypeRef held, const char* tag,
-                                     void* layerKey) {
-    if (!held) return;
+static bool MacapkLayerCaptureFinish(CFTypeRef held, const char* tag,
+                                     void* layerKey, bool writeSource = true) {
+    if (!held) return false;
+    bool copied = false;
+    std::lock_guard<std::mutex> readback(g_layercap_readback_mu);
     if (!tag) tag = "layer";
     // No autorelease pool is guaranteed on a guest render thread, and every
     // Metal factory call below returns an autoreleased object.
@@ -3042,11 +3071,13 @@ static void MacapkLayerCaptureFinish(CFTypeRef held, const char* tag,
             // v1.0.1036: park the pixels for the COMPOSITE source (keyed by
             // layer identity) before the per-layer PNG is written.
             MacapkStoreLayerPixels(layerKey, g_layercap_buf.data(), W, H);
-            SelfCaptureWriteRGBA(g_layercap_buf.data(), W, H, /*bottom_up=*/false, tag);
+            copied = true;
+            if (writeSource) SelfCaptureWriteRGBA(g_layercap_buf.data(), W, H, /*bottom_up=*/false, tag);
         }
     done:
         CFRelease(held);   // drop our +1; the drawable returns to the pool
     }
+    return copied;
 }
 
 // Called from the nextDrawable swizzle for EVERY vended drawable, on whatever
@@ -3066,23 +3097,25 @@ static void MacapkLayerCaptureOnDrawable(CAMetalLayer* layer, id<CAMetalDrawable
                                  "(MACAPK_SELF_CAPTURE_LAYER=0 to opt out)\n", (void*)layer);
         return;
     }
-    CFTypeRef finish = nullptr;
-    int slot;
+    // Acquisition is not presentation: caching the newest acquired drawable
+    // otherwise hides the previous completed frame on continuously drawing pages.
+    void* key = (void*)layer;
+    [d addPresentedHandler:^(id<MTLDrawable> presented) {
+        MacapkRememberDrawable(key, (id<CAMetalDrawable>)presented);
+    }];
+    PendingLayerCapture finish;
     {
         std::lock_guard<std::mutex> lk(g_layercap_mu);
-        slot = MacapkLayerSlotFor(layer);
-        if (slot >= 0) { finish = g_layercap_pending[slot]; g_layercap_pending[slot] = nullptr; }
+        finish = g_layercap_pending.take((void*)layer);
     }
-    if (slot < 0) return;                            // a third layer: not instrumented
     const char* tag = MacapkLayerTagFor(layer);
-    if (finish) MacapkLayerCaptureFinish(finish, tag, (void*)layer);   // outside the lock: blocks on the GPU
+    if (finish.drawable) MacapkLayerCaptureFinish(finish.drawable, finish.tag, finish.layer);
     if (SelfCaptureRequested(tag)) {
         CFTypeRef held = CFRetain((CFTypeRef)d);     // +1 keeps the content valid
         CFTypeRef stale = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_layercap_mu);
-            stale = g_layercap_pending[slot];        // cannot happen, but never leak
-            g_layercap_pending[slot] = held;
+            stale = g_layercap_pending.put((void*)layer, held, tag);
         }
         if (stale) CFRelease(stale);
     }
@@ -3206,10 +3239,7 @@ static void MacapkScoreSnapshotAsync(bool dc) {
 // refreshed the store for this window. Entries persist across windows, so an
 // idle guest still composites with its last-presented frame.
 //
-// KNOWN LIMITS (say them rather than hide them): a THIRD CAMetalLayer (the
-// video self-test path can make one) has no slot in the readback machinery, so
-// it composites from a stale or absent entry -- the skip is logged; and a
-// metal layer that has never presented since launch has no pixels to blend
+// A metal layer that has never presented since launch has no pixels to blend
 // (logged the same way).
 // Draw an IOSurface layer's contents into the composite. The IOSurface present
 // path (CocoaPresentFrameFrom) writes exactly the bytes the CGImage path hands
@@ -3243,30 +3273,33 @@ static bool MacapkDrawIOSurfaceContents(CGContextRef ctx, CGRect rectPx, IOSurfa
     return drew;
 }
 
-static void MacapkBuildCompositeCapture() {
+static MTKView* MacapkCaptureView() {
+    MTKView* candidates[] = { g_active_render_view, g_last_metal_view, g_last_gl_metal_view };
+    for (MTKView* view : candidates) if (view && view.window) return view;
+    for (MTKView* view : candidates) if (view) return view;
+    return nil;
+}
+
+static bool MacapkBuildCompositeCapture() {
     @autoreleasepool {
-        MTKView* cands[3] = { g_active_render_view, g_last_metal_view,
-                              g_last_gl_metal_view };
-        MTKView* view = nil;
-        for (MTKView* v : cands) if (v && v.window) { view = v; break; }
-        if (!view) for (MTKView* v : cands) if (v) { view = v; break; }
-        if (!view || !view.layer) { MacapkLayerCaptureAbandon("composite"); return; }
+        MTKView* view = MacapkCaptureView();
+        if (!view || !view.layer) { MacapkLayerCaptureAbandon("composite"); return false; }
         CALayer* root = view.layer;
         CGFloat scale = root.contentsScale;
         if (scale <= 0) scale = view.window ? view.window.backingScaleFactor : 2.0;
         const int W = (int)std::llround(root.bounds.size.width  * scale);
         const int H = (int)std::llround(root.bounds.size.height * scale);
         if (W <= 0 || H <= 0 || W > 16384 || H > 16384) {
-            MacapkLayerCaptureAbandon("composite"); return;
+            MacapkLayerCaptureAbandon("composite"); return false;
         }
         const size_t stride = (size_t)W * 4;
         std::vector<uint8_t> out(stride * (size_t)H);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        if (!cs) { MacapkLayerCaptureAbandon("composite"); return; }
+        if (!cs) { MacapkLayerCaptureAbandon("composite"); return false; }
         CGContextRef ctx = CGBitmapContextCreate(
             out.data(), (size_t)W, (size_t)H, 8, stride, cs,
             kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-        if (!ctx) { CGColorSpaceRelease(cs); MacapkLayerCaptureAbandon("composite"); return; }
+        if (!ctx) { CGColorSpaceRelease(cs); MacapkLayerCaptureAbandon("composite"); return false; }
         CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
         CGContextFillRect(ctx, CGRectMake(0, 0, W, H));
         // Snapshot + stable-sort the sublayers by zPosition (CA's rule: sort by
@@ -3358,37 +3391,150 @@ static void MacapkBuildCompositeCapture() {
         // CGBitmapContext memory rows already run top-down; the writer scores
         // and completes the marker bit exactly as for every other source.
         SelfCaptureWriteRGBA(out.data(), W, H, /*bottom_up=*/false, "composite");
+        char path[PATH_MAX]; MacapkCaptureOutPath(path, sizeof(path), "composite");
+        return ::access(path, R_OK) == 0;
     }
 }
 
+// Only proven full-viewport opacity may hide a lower Metal layer. The canvas
+// often already contains all TextureView/UC pixels; an alpha hole must keep GL.
+static bool MacapkLayerCoversViewport(CALayer* l, CGRect viewport) {
+    if (l.hidden || l.opacity != 1 || l.mask || l.cornerRadius != 0
+        || !CATransform3DIsIdentity(l.transform) || !CGRectContainsRect(l.frame, viewport)
+        || ![l.contentsGravity isEqualToString:kCAGravityResize]
+        || !CGRectEqualToRect(l.contentsRect, CGRectMake(0, 0, 1, 1))) return false;
+    id c = l.contents;
+    if (!c) return false;
+    CFTypeRef contents = (__bridge CFTypeRef)c;
+    if (CFGetTypeID(contents) == IOSurfaceGetTypeID()) {
+        IOSurfaceRef surface = (IOSurfaceRef)contents;
+        if (IOSurfaceGetPixelFormat(surface) != kCVPixelFormatType_32BGRA
+            || IOSurfaceGetBytesPerElement(surface) != 4
+            || IOSurfaceLock(surface, kIOSurfaceLockReadOnly, nullptr) != kIOReturnSuccess) return false;
+        bool opaque = MacapkAlpha8Opaque((const uint8_t*)IOSurfaceGetBaseAddress(surface),
+            IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface), 3);
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
+        return opaque;
+    }
+    if (CFGetTypeID(contents) != CGImageGetTypeID()) return false;
+    CGImageRef image = (CGImageRef)contents;
+    const CGImageAlphaInfo alpha = CGImageGetAlphaInfo(image);
+    if (alpha == kCGImageAlphaNone || alpha == kCGImageAlphaNoneSkipFirst || alpha == kCGImageAlphaNoneSkipLast) return true;
+    if (CGImageGetBitsPerPixel(image) != 32 || CGImageGetBitsPerComponent(image) != 8) return false;
+    const CGBitmapInfo order = CGImageGetBitmapInfo(image) & kCGBitmapByteOrderMask;
+    if (order != kCGBitmapByteOrder32Little && order != kCGBitmapByteOrder32Big) return false;
+    const bool first = alpha == kCGImageAlphaPremultipliedFirst || alpha == kCGImageAlphaFirst;
+    const bool last = alpha == kCGImageAlphaPremultipliedLast || alpha == kCGImageAlphaLast;
+    if (!first && !last) return false;
+    CFDataRef bytes = CGDataProviderCopyData(CGImageGetDataProvider(image));
+    bool opaque = bytes && (size_t)CFDataGetLength(bytes) >= CGImageGetBytesPerRow(image) * CGImageGetHeight(image)
+        && MacapkAlpha8Opaque(CFDataGetBytePtr(bytes), CGImageGetWidth(image), CGImageGetHeight(image),
+            CGImageGetBytesPerRow(image), (first == (order == kCGBitmapByteOrder32Little)) ? 3 : 0);
+    if (bytes) CFRelease(bytes);
+    return opaque;
+}
+
+// Main-thread layer snapshot: never substitute an old pixel cache for a visible
+// Metal layer whose latest drawable has not completed presentation.
+static bool MacapkCaptureCurrentComposite() {
+    if (!MacapkSelfCaptureEnabled() || g_cap_window_live.load(std::memory_order_acquire)) return false;
+    char req[PATH_MAX]; MacapkCaptureReqPath(req, sizeof(req));
+    if (!MacapkCurrentCompositeRequested(req)) return false;
+    static uint64_t started = 0;
+    const uint64_t now = (uint64_t)(CACurrentMediaTime() * 1000.0);
+    struct stat st;
+    // The request's inode distinguishes retries after an incomplete capture.
+    static ino_t requestInode = 0;
+    if (::stat(req, &st) != 0) return false;
+    if (requestInode != st.st_ino) { requestInode = st.st_ino; started = now; }
+    MTKView* view = MacapkCaptureView();
+    bool ready = view && view.layer;
+    std::vector<MacapkLatestDrawable> layers;
+    if (ready) {
+        std::vector<CALayer*> visible;
+        for (CALayer* l in view.layer.sublayers) visible.push_back(l);
+        std::stable_sort(visible.begin(), visible.end(), [](CALayer* a, CALayer* b) { return a.zPosition < b.zPosition; });
+        size_t firstVisible = 0;
+        for (size_t i = visible.size(); i > 0; --i)
+            if (MacapkLayerCoversViewport(visible[i - 1], view.layer.bounds)) { firstVisible = i - 1; break; }
+        std::lock_guard<std::mutex> lk(g_latest_drawable_mu);
+        for (size_t i = firstVisible; i < visible.size(); ++i) {
+            CALayer* l = visible[i];
+            if (l.hidden || l.opacity <= 0.001f || l.bounds.size.width <= 0 || l.bounds.size.height <= 0
+                || ![l isKindOfClass:[CAMetalLayer class]]) continue;
+            const MacapkLatestDrawable* found = nullptr;
+            for (auto& e : g_latest_drawables) if (e.layer == (void*)l && e.drawable) { found = &e; break; }
+            id<CAMetalDrawable> d = found ? (id<CAMetalDrawable>)found->drawable : nil;
+            if (!d || d.presentedTime <= 0) { ready = false; break; }
+            layers.push_back(*found); CFRetain(found->drawable);
+        }
+    }
+    for (auto& e : layers) {
+        if (ready) {
+            if (!MacapkLayerCaptureFinish(e.drawable, MacapkLayerTagFor((CAMetalLayer*)e.layer), e.layer, false)) ready = false;
+        } else CFRelease(e.drawable);
+    }
+    if (ready && MacapkBuildCompositeCapture()) {
+        char done[PATH_MAX], tmp[PATH_MAX]; MacapkCaptureDonePath(done, sizeof(done));
+        std::snprintf(tmp, sizeof(tmp), "%s.part", done);
+        if (FILE* f = std::fopen(tmp, "w")) {
+            std::fputs("composite\n", f); std::fclose(f);
+            ::unlink(req); ::rename(tmp, done);
+            requestInode = 0;
+            return true;
+        }
+    }
+    if (now - started >= 150) {
+        // Unknown/in-flight layers retain the complete legacy collection window.
+        if (FILE* f = std::fopen(req, "w")) std::fclose(f);
+        requestInode = 0;
+        return false;
+    }
+    return true; // pending: do not let a partial layer collection claim this request
+}
+
 void SelfCapturePollFromMainThread() {
+    if (MacapkCaptureCurrentComposite()) return;
     // The layer readback can be stranded if the guest presented once and then
     // went quiet: nothing will call the swizzle again to finish it. Take it over
     // here. Safe on the main thread -- the blit reads a drawable WE hold a
     // reference to, and the guest cannot be rendering into an already-presented
     // drawable.
-    CFTypeRef finish[2] = {nullptr, nullptr};
+    std::vector<PendingLayerCapture> finish;
     {
         std::lock_guard<std::mutex> lk(g_layercap_mu);
         // Give the guest's own next acquire a few ticks to do it first (its
         // drawable is fresher); only then step in.
-        static int idle_ticks[2] = {0, 0};
-        for (int s = 0; s < 2; ++s) {
-            if (!g_layercap_pending[s]) { idle_ticks[s] = 0; continue; }
-            if (++idle_ticks[s] >= 3) {
-                finish[s] = g_layercap_pending[s];
-                g_layercap_pending[s] = nullptr;
-                idle_ticks[s] = 0;
+        finish = g_layercap_pending.tick();
+    }
+    for (const auto& pending : finish)
+        MacapkLayerCaptureFinish(pending.drawable, pending.tag, pending.layer);
+
+    // Refresh an idle layer only after CoreAnimation confirms presentation.
+    // Do not read a drawable still being rendered. Restrict this to layers in
+    // the current view, so a detached activity cannot claim the source's bit.
+    MTKView* renderView = MacapkCaptureView();
+    std::vector<MacapkLatestDrawable> latest;
+    {
+        std::lock_guard<std::mutex> lk(g_latest_drawable_mu);
+        for (auto& e : g_latest_drawables) {
+            if (!e.drawable) continue;
+            bool visible = renderView && (void*)renderView.layer == e.layer;
+            if (!visible) for (CALayer* l in renderView.layer.sublayers)
+                if (!l.hidden && l.opacity > 0 && (void*)l == e.layer) { visible = true; break; }
+            if (visible) {
+                latest.push_back(e);
+                CFRetain(e.drawable);
             }
         }
     }
-    // The tag is identity-derived, so recover it from the slot's remembered layer
-    // pointer rather than from the slot index.
-    for (int s = 0; s < 2; ++s)
-        if (finish[s])
-            MacapkLayerCaptureFinish(finish[s],
-                MacapkLayerTagFor((CAMetalLayer*)g_layercap_slot_layer[s]),
-                g_layercap_slot_layer[s]);
+    for (auto& e : latest) {
+        id<CAMetalDrawable> d = (id<CAMetalDrawable>)e.drawable;
+        const char* tag = MacapkLayerTagFor((CAMetalLayer*)e.layer);
+        if (d.presentedTime > 0 && SelfCaptureRequested(tag))
+            MacapkLayerCaptureFinish(e.drawable, tag, e.layer);
+        else CFRelease(e.drawable);
+    }
 
     // Serve the retained snapshots. SelfCaptureRequested is what opens the
     // capture window, so calling it here is ALSO what lets a completely idle app
@@ -4193,7 +4339,7 @@ bool CocoaInit() {
         // Honors NSWindowStyleMaskResizable above so toggleFullScreen
         // actually engages.
         const char* fs = std::getenv("MACAPK_FULLSCREEN");
-        if (fs && std::strcmp(fs, "1") == 0) {
+        if (!fixed_viewport_requested() && fs && std::strcmp(fs, "1") == 0) {
             [g_placeholder_window toggleFullScreen:nil];
         }
 
@@ -4908,6 +5054,45 @@ bool CocoaPostHostMouse(int action, float fx, float fy) {
     if ([NSThread isMainThread]) body(); else dispatch_sync(dispatch_get_main_queue(), body);
     return ok;
 }
+// Never hold the Android owner thread waiting indefinitely for AppKit (which may wait on Java).
+static bool viewport_on_main(bool (^body)(void)) {
+    if ([NSThread isMainThread]) return body();
+    struct Result { std::mutex mu; std::condition_variable cv; bool done = false, value = false; };
+    auto result = std::make_shared<Result>();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        const bool value = body();
+        std::lock_guard<std::mutex> lock(result->mu);
+        result->value = value; result->done = true; result->cv.notify_all();
+    });
+    std::unique_lock<std::mutex> lock(result->mu);
+    return result->cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return result->done; }) && result->value;
+}
+static bool viewport_fixed_main() {
+    NSWindow *w = g_placeholder_window;
+    return g_viewport_locked && w && !(w.styleMask & NSWindowStyleMaskFullScreen) &&
+        NSEqualSizes(w.contentView.bounds.size, g_viewport_content_size) &&
+        w.backingScaleFactor == g_viewport_backing_scale &&
+        g_phone_w == g_viewport_phone_w && g_phone_h == g_viewport_phone_h;
+}
+bool CocoaViewportFixed() { return viewport_on_main(^bool { return viewport_fixed_main(); }); }
+bool CocoaLockViewport() {
+    if (!fixed_viewport_requested()) return false;
+    return viewport_on_main(^bool {
+        NSWindow *w = g_placeholder_window;
+        if (!w || (w.styleMask & NSWindowStyleMaskFullScreen) || g_fs_transition) return false;
+        if (!g_viewport_locked) {
+            NSSize size = w.contentView.bounds.size;
+            if (size.width <= 0 || size.height <= 0) return false;
+            g_viewport_content_size = size;
+            g_viewport_phone_w = g_phone_w; g_viewport_phone_h = g_phone_h;
+            g_viewport_backing_scale = w.backingScaleFactor;
+            g_viewport_locked = true;
+            apply_window_locks_main(size.width, size.height, size.width, size.height);
+        }
+        return viewport_fixed_main();
+    });
+}
+
 int CocoaPhoneWidth()  { SFTRACE("CocoaPhoneWidth -> %d",  g_phone_w); return g_phone_w; }
 int CocoaPhoneHeight() { SFTRACE("CocoaPhoneHeight -> %d", g_phone_h); return g_phone_h; }
 
@@ -5195,6 +5380,7 @@ static void apply_live_outcome_main(const winpolicy::LiveOutcome& o,
 // resolveFixedOrientationConfiguration's parent is the task/display) -- then
 // letterboxes inside the window when the box fits, or grows the window to it.
 static void apply_requested_orientation_policy_main(int screen_orientation) {
+    if (g_viewport_locked) return;
     const winpolicy::LiveOutcome o = winpolicy::ApplyRequestedOrientation(
         g_wp.traits, g_wp.settings, g_wp.live, screen_orientation);
     apply_live_outcome_main(o);
@@ -5208,6 +5394,7 @@ static void apply_requested_orientation_policy_main(int screen_orientation) {
 // window is on now WITH the app's current requested orientation, persist
 // (unless `persist` is false or the run pinned MACAPK_WINDOW_PREF), reshape.
 static void toggle_window_pref_main(bool persist) {
+    if (g_viewport_locked) return;
     winpolicy::DisplayBudget screen;
     std::string desc;
     if (g_wp.live.fullscreen) {
@@ -5256,6 +5443,13 @@ static bool activity_window_transition_main(const std::string& component, int ev
                                             int cover_token, int* app_w_px, int* app_h_px,
                                             int* change) {
     if (!g_wp.active) return false;
+    // Activities share the session's device display, instead of each growing a desktop window.
+    if (g_viewport_locked) {
+        *app_w_px = (int)std::lround(g_viewport_phone_w * g_viewport_backing_scale);
+        *app_h_px = (int)std::lround(g_viewport_phone_h * g_viewport_backing_scale);
+        *change = (int)winpolicy::LiveChange::kNone;
+        return true;
+    }
     const winpolicy::ActivityEvent ev = event == 1 ? winpolicy::ActivityEvent::kStartRoot
                                       : event == 2 ? winpolicy::ActivityEvent::kReveal
                                       : event == 3 ? winpolicy::ActivityEvent::kStartOverFinishing
@@ -5371,7 +5565,7 @@ void CocoaApplyWindowOrientationFor(const std::string& component, int token,
                                     int screen_orientation, int behind) {
     const std::string comp = component;
     dispatch_main_async_void(^{
-        if (!g_wp.active) return;
+        if (!g_wp.active || g_viewport_locked) return;
         const winpolicy::LiveOutcome o = winpolicy::ApplyRequestedOrientationFrom(
             g_wp.traits, g_wp.settings, g_wp.live, comp, token, screen_orientation, behind);
         apply_live_outcome_main(o);
@@ -5415,6 +5609,17 @@ int CocoaWindowOverrideOrientation(const std::string& component, int record_orie
 static void apply_window_locks_main(double box_w, double box_h, double cur_w, double cur_h) {
     NSWindow* w = g_placeholder_window;
     if (!w || box_w <= 0 || box_h <= 0) return;
+    if (fixed_viewport_requested()) {
+        NSSize size = g_viewport_locked ? g_viewport_content_size : NSMakeSize(cur_w, cur_h);
+        if (size.width <= 0 || size.height <= 0) return;
+        w.styleMask &= ~NSWindowStyleMaskResizable;
+        w.collectionBehavior = (w.collectionBehavior & ~NSWindowCollectionBehaviorFullScreenPrimary) | NSWindowCollectionBehaviorFullScreenNone;
+        [[w standardWindowButton:NSWindowZoomButton] setEnabled:NO];
+        w.contentMinSize = NSMakeSize(1, 1);
+        w.contentMaxSize = size;
+        w.contentMinSize = size;
+        return;
+    }
     if (window_is_fullscreen()) return;   // AppKit owns a fullscreen window's size
     double min_short = 240.0;
     if (free_resize_on() && g_wp.active && g_wp.live.decision.policy_applies) {
@@ -5668,6 +5873,7 @@ static void window_did_fail_fullscreen_main(bool entering) {
 // window-manager size (a tile, Fill) is accepted as given, exactly as
 // winpolicy::ApplyUserResize accepts it (golden `resize:` rows, mutant 36).
 static NSSize window_will_resize_main(NSWindow* w, NSSize frame_size) {
+    if (fixed_viewport_requested() && g_viewport_locked) return w.frame.size;
     if (!g_wp.active || !free_resize_on() || g_fs_transition || window_is_fullscreen()
         || !w.inLiveResize)
         return frame_size;
@@ -5683,6 +5889,14 @@ static NSSize window_will_resize_main(NSWindow* w, NSSize frame_size) {
 // A user resize ended (a drag), or the window manager resized the window
 // (tiling, Fill, Zoom, AX): the window is the display now.
 static void apply_user_resize_main(NSWindow* w, const char* how) {
+    if (fixed_viewport_requested()) {
+        if (g_viewport_locked && !NSEqualSizes(w.contentView.bounds.size, g_viewport_content_size)) {
+            ++g_own_frame_change;
+            [w setContentSize:g_viewport_content_size];
+            --g_own_frame_change;
+        }
+        return;
+    }
     if (!g_wp.active || g_fs_transition || window_is_fullscreen()) return;
     const NSSize cs = [[w contentView] bounds].size;
     const int w_pt = (int) std::lround(cs.width), h_pt = (int) std::lround(cs.height);
@@ -10042,7 +10256,7 @@ static void reshape_placeholder_to_globals_main(ReshapeAnchor anchor) {
 // docs/live-aspect-resize-design_2026-06-24.md.
 static void rotate_render(bool persist_pref) {
     dispatch_main_async_void(^{
-        if (!g_placeholder_window) return;
+        if (!g_placeholder_window || g_viewport_locked) return;
         // v1.0.1647 (owner, 2026-09-25: "We also have command R that rotates
         // the screen"): under the window policy the display is a large screen
         // that never rotates, so Cmd+R is the per-app user control instead --
@@ -10085,6 +10299,7 @@ void CocoaApplyRequestedOrientation(bool landscape) {
     SFTRACE("applyRequestedOrientation POSTED landscape=%d phone(before)=%dx%d",
             landscape ? 1 : 0, g_phone_w, g_phone_h);
     dispatch_main_async_void(^{
+        if (g_viewport_locked) return;
         SFTRACE("applyRequestedOrientation EXECUTING landscape=%d "
                 "phone(stillBefore)=%dx%d",
                 landscape ? 1 : 0, g_phone_w, g_phone_h);
@@ -12424,6 +12639,7 @@ static jlong MacapkQueryContentInsetsPacked(JNIEnv* env) {
     static jclass    s_cls   = nullptr;
     static jmethodID s_mid   = nullptr;
     static bool      s_tried = false;
+    static bool      s_constant_zero = false;
     if (!s_tried) {
         s_tried = true;
         jclass c = env->FindClass("com/macapk/loader/StatusBarDriver");
@@ -12441,11 +12657,21 @@ static jlong MacapkQueryContentInsetsPacked(JNIEnv* env) {
                     "this runtime binary\n");
             } else {
                 s_cls = (jclass) env->NewGlobalRef(c);
+                // This Java policy is process-constant. With no system bars all
+                // four insets are zero, regardless of flags, rotation or density.
+                jmethodID bars = env->GetStaticMethodID(c, "systemBarsEnabled", "()Z");
+                if (bars) {
+                    const jboolean enabled = env->CallStaticBooleanMethod(c, bars);
+                    if (!env->ExceptionCheck()) s_constant_zero = enabled == JNI_FALSE;
+                }
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (s_constant_zero) std::fprintf(stderr,
+                    "[I] cocoa_v2: constant zero insets; per-frame JNI query disabled\n");
             }
             env->DeleteLocalRef(c);
         }
     }
-    if (!s_cls || !s_mid) return 0;
+    if (s_constant_zero || !s_cls || !s_mid) return 0;
     jlong v = env->CallStaticLongMethod(s_cls, s_mid);
     if (env->ExceptionCheck()) { env->ExceptionClear(); return 0; }
     return v;

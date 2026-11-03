@@ -201,6 +201,17 @@ public final class ServiceRegistry {
     public static final boolean BIND_ASYNC =
         !"0".equals(System.getenv("MACAPK_SVC_BIND_ASYNC"));
 
+    // shortcut: this runtime has no separate service processes or Binder IPC;
+    // opt-in rejection prevents a remote service from running in the main JVM.
+    private static boolean unsupportedProcess(String cls) {
+        if (!"1".equals(System.getenv("MACAPK_SERVICE_PROCESS_GATE"))) return false;
+        String process = com.macapk.loader.Boot.foreignProcessFor(cls);
+        if (process == null) return false;
+        System.err.println("[macapk] service unavailable: " + cls + " requires separate process "
+            + process + "; this runtime only hosts in-process services");
+        return true;
+    }
+
     /** bindService's synchronous half: does this Intent name a Service we can
      *  bring up? AOSP's bindService returns false exactly when
      *  ActiveServices.retrieveServiceLocked finds nothing, before anything is
@@ -209,6 +220,7 @@ public final class ServiceRegistry {
     public static boolean resolves(Context ctx, Intent intent) {
         String cls = classNameOf(intent);
         if (cls == null) return false;
+        if (unsupportedProcess(cls)) return false;
         if (sLive.containsKey(cls)) return true;
         if (macapkIsDeclaredButDisabled(ctx, cls)) return false;
         try {
@@ -293,6 +305,7 @@ public final class ServiceRegistry {
     public static ComponentName start(Context ctx, Intent intent, boolean foreground) {
         String cls = classNameOf(intent);
         if (cls == null) return null;
+        if (unsupportedProcess(cls)) return null;
         // A SERVICE RUNS ON THE MAIN THREAD (v1.0.930). AOSP never invokes a
         // service lifecycle callback on the caller's thread: startService goes
         // through the AMS and comes back as `sendMessage(H.SERVICE_ARGS, s)`
@@ -496,6 +509,7 @@ public final class ServiceRegistry {
      *  comes THROUGH here, via ensureLive, precisely so there is one
      *  instance per component rather than two competing create paths.) */
     private static Service ensure(Context ctx, String cls) {
+        if (unsupportedProcess(cls)) return null;
         Service existing = sLive.get(cls);
         if (existing != null) return existing;
         // GATE-MUTANT(svcstop:drain) begin

@@ -435,6 +435,17 @@ public final class ClassFileRewriter {
                 }
             }
 
+            if (BOOT_CLASS_LOADER && containsNeedle(raw, NEEDLE_GET_CLASS_LOADER)) {
+                for (MethodEntry m : cf.methods) {
+                    if (m.code != null) hits += rewriteBootClassLoader(cf, m.code);
+                }
+            }
+
+            if (BUFFER_READ_COPY && containsNeedle(raw, NEEDLE_BYTE_BUFFER)) {
+                for (MethodEntry method : cf.methods)
+                    if (method.code != null) hits += rewriteBufferReadCopy(cf, method.code);
+            }
+
             if (hits > 0) {
                 byte[] out = cf.serialize();
                 if (DEBUG) {
@@ -608,6 +619,8 @@ public final class ClassFileRewriter {
             if (!sForeignProcess.isEmpty() && sForeignProcess.containsKey(dotted)) {
                 return true;
             }
+            if (BOOT_CLASS_LOADER && containsNeedle(raw, NEEDLE_GET_CLASS_LOADER)) return true;
+            if (BUFFER_READ_COPY && containsNeedle(raw, NEEDLE_BYTE_BUFFER)) return true;
             if (containsNeedle(raw, NEEDLE_RUN_FINALIZERS_ON_EXIT)
                 || containsNeedle(raw, FROM_BYTES_G)) {
                 return true;
@@ -1020,6 +1033,151 @@ public final class ClassFileRewriter {
      *  (Ljava/lang/String;)Ljava/lang/reflect/Field;` in one method into
      *  `invokestatic com/macapk/loader/LibcoreFields.getDeclaredField:
      *  (Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Field;`. */
+    private static final boolean BOOT_CLASS_LOADER =
+        !"0".equals(System.getenv("MACAPK_ART_BOOT_CLASSLOADER"));
+    private static final byte[] NEEDLE_GET_CLASS_LOADER =
+        "getClassLoader".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    private static final boolean BUFFER_READ_COPY =
+        "1".equals(System.getenv("MACAPK_BUFFER_ARRAYCOPY"));
+    private static final byte[] NEEDLE_BYTE_BUFFER =
+        "java/nio/ByteBuffer".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+
+    private static int localSlot(byte[] bytes, int pc, int general, int shortForm) {
+        int opcode = bytes[pc] & 255;
+        if (opcode == general) return bytes[pc + 1] & 255;
+        return opcode >= shortForm && opcode < shortForm + 4 ? opcode - shortForm : -1;
+    }
+
+    // All paths must kill the temporary local before reading it again, including catches.
+    private static boolean deadLocalAfter(CodeAttr code, List<Integer> pcs, int start, int slot, boolean reference) {
+        byte[] bytes = code.code;
+        boolean[] seen = new boolean[pcs.size()];
+        java.util.ArrayDeque<Integer> pending = new java.util.ArrayDeque<>();
+        pending.add(start);
+        int table = code.codeOffset + code.codeLen;
+        int catches = u2(bytes, table);
+        while (!pending.isEmpty()) {
+            int index = pending.removeFirst();
+            if (index < 0 || index >= pcs.size()) return false;
+            if (seen[index]) continue;
+            seen[index] = true;
+            int pc = pcs.get(index), op = bytes[pc] & 255;
+            if (localSlot(bytes, pc, reference ? 0x19 : 0x15, reference ? 0x2a : 0x1a) == slot) return false;
+            if (!reference && op == 0x84 && (bytes[pc + 1] & 255) == slot) return false;
+            if (localSlot(bytes, pc, 0x3a, 0x4b) == slot || localSlot(bytes, pc, 0x36, 0x3b) == slot) continue;
+            for (int i = 0; i < catches; ++i) {
+                int entry = table + 2 + 8 * i, relative = pc - code.codeOffset;
+                if (relative >= u2(bytes, entry) && relative < u2(bytes, entry + 2))
+                    pending.add(pcs.indexOf(code.codeOffset + u2(bytes, entry + 4)));
+            }
+            if ((op >= 0xac && op <= 0xb1) || op == 0xbf) continue;
+            if ((op >= 0x99 && op <= 0xa7) || op == 0xc6 || op == 0xc7 || op == 0xc8) {
+                int displacement = op == 0xc8 ? u4(bytes, pc + 1) : (short)u2(bytes, pc + 1);
+                pending.add(pcs.indexOf(pc + displacement));
+                if (op == 0xa7 || op == 0xc8) continue;
+            }
+            pending.add(index + 1);
+        }
+        return true;
+    }
+
+    private static int rewriteBufferReadCopy(ClassFile cf, CodeAttr code) {
+        byte[] bytes = code.code;
+        List<Integer> pcs = new ArrayList<>();
+        int array = -1, offset = -1, copy = -1;
+        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
+            int op = bytes[pc] & 255, length = instructionLength(op, bytes, pc);
+            if (length <= 0 || op == 0xc4 || op == 0xa8 || op == 0xa9 || op == 0xc9) return 0;
+            int at = pcs.size(); pcs.add(pc);
+            if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(bytes, pc + 1), "java/nio/ByteBuffer", "array", "()[B")) {
+                if (array != -1) return 0; array = at;
+            }
+            if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(bytes, pc + 1), "java/nio/ByteBuffer", "arrayOffset", "()I")) {
+                if (offset != -1) return 0; offset = at;
+            }
+            if (op == OP_INVOKESTATIC && isMethodref(cf, u2(bytes, pc + 1), "java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V")) {
+                if (copy != -1) return 0; copy = at;
+            }
+            pc += length;
+        }
+        if (array < 4 || offset != array + 6 || copy < offset + 7 || copy + 1 >= pcs.size()) return 0;
+        int root = localSlot(bytes, pcs.get(array - 4), 0x19, 0x2a);
+        int buffer = localSlot(bytes, pcs.get(array - 2), 0x3a, 0x4b);
+        int source = localSlot(bytes, pcs.get(array + 1), 0x3a, 0x4b);
+        int other = localSlot(bytes, pcs.get(offset - 2), 0x3a, 0x4b);
+        int position = localSlot(bytes, pcs.get(offset + 1), 0x36, 0x3b);
+        if (root < 0 || buffer < 0 || source < 0 || other < 0 || position < 0
+                || root == source || other == source
+                || localSlot(bytes, pcs.get(array - 1), 0x19, 0x2a) != buffer
+                || localSlot(bytes, pcs.get(offset - 1), 0x19, 0x2a) != other
+                || localSlot(bytes, pcs.get(offset - 4), 0x19, 0x2a) != root
+                || (bytes[pcs.get(array - 3)] & 255) != 0xb4
+                || (bytes[pcs.get(offset - 3)] & 255) != 0xb4
+                || u2(bytes, pcs.get(array - 3) + 1) != u2(bytes, pcs.get(offset - 3) + 1)) return 0;
+        if (localSlot(bytes, pcs.get(copy - 5), 0x19, 0x2a) != source
+                || localSlot(bytes, pcs.get(copy - 4), 0x15, 0x1a) != position
+                || localSlot(bytes, pcs.get(copy - 3), 0x19, 0x2a) < 0
+                || localSlot(bytes, pcs.get(copy - 2), 0x15, 0x1a) < 0
+                || localSlot(bytes, pcs.get(copy - 1), 0x15, 0x1a) < 0) return 0;
+        for (int i = offset + 2; i < copy; ++i) {
+            int pc = pcs.get(i), op = bytes[pc] & 255;
+            boolean load = localSlot(bytes, pc, 0x19, 0x2a) >= 0 || localSlot(bytes, pc, 0x15, 0x1a) >= 0;
+            boolean store = localSlot(bytes, pc, 0x3a, 0x4b) >= 0 || localSlot(bytes, pc, 0x36, 0x3b) >= 0;
+            if (!load && !store && op != 0xb4) return 0;
+            if (i != copy - 5 && localSlot(bytes, pc, 0x19, 0x2a) == source) return 0;
+            if (i != copy - 4 && localSlot(bytes, pc, 0x15, 0x1a) == position) return 0;
+            if (store && (localSlot(bytes, pc, 0x3a, 0x4b) == source
+                    || localSlot(bytes, pc, 0x36, 0x3b) == position)) return 0;
+        }
+        // Reject control-flow entrances and exception handlers inside the expression.
+        int begin = pcs.get(array), end = pcs.get(copy) + 3;
+        for (int pc : pcs) {
+            int op = bytes[pc] & 255;
+            if ((op >= 0x99 && op <= 0xa7) || op == 0xc6 || op == 0xc7 || op == 0xc8) {
+                int target = pc + (op == 0xc8 ? u4(bytes, pc + 1) : (short)u2(bytes, pc + 1));
+                if (target > begin && target < end) return 0;
+            }
+        }
+        int table = code.codeOffset + code.codeLen;
+        for (int i = 0, count = u2(bytes, table); i < count; ++i) {
+            int entry = table + 2 + i * 8;
+            if (code.codeOffset + u2(bytes, entry) < end && code.codeOffset + u2(bytes, entry + 2) > begin) return 0;
+        }
+        if (!deadLocalAfter(code, pcs, copy + 1, source, true)
+                || !deadLocalAfter(code, pcs, copy + 1, position, false)) return 0;
+        int helper = cf.findOrAddClass("com/macapk/loader/ByteBufferReadCopy");
+        bytes[begin] = (byte)OP_INVOKESTATIC;
+        writeU2(bytes, begin + 1, cf.findOrAddMethodref(helper, cf.findOrAddNameAndType("array", "(Ljava/nio/ByteBuffer;)[B")));
+        int offsetPc = pcs.get(offset);
+        bytes[offsetPc] = (byte)OP_INVOKESTATIC;
+        writeU2(bytes, offsetPc + 1, cf.findOrAddMethodref(helper, cf.findOrAddNameAndType("offset", "(Ljava/nio/ByteBuffer;)I")));
+        return 2;
+    }
+
+    private static int rewriteBootClassLoader(ClassFile cf, CodeAttr code) {
+        int hits = 0, target = -1;
+        byte[] bc = code.code;
+        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
+            int op = bc[pc] & 0xff;
+            int len = instructionLength(op, bc, pc);
+            if (len <= 0) break;
+            if (op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(bc, pc + 1),
+                    "java/lang/Class", "getClassLoader", "()Ljava/lang/ClassLoader;")) {
+                if (target < 0) {
+                    int cls = cf.findOrAddClass("com/macapk/loader/ArtClassLoaders");
+                    int nt = cf.findOrAddNameAndType("getClassLoader",
+                        "(Ljava/lang/Class;)Ljava/lang/ClassLoader;");
+                    target = cf.findOrAddMethodref(cls, nt);
+                }
+                bc[pc] = (byte)OP_INVOKESTATIC;
+                writeU2(bc, pc + 1, target);
+                hits++;
+            }
+            pc += len;
+        }
+        return hits;
+    }
+
     private static int patternLLibcoreFieldNames(ClassFile cf, CodeAttr code, String className) {
         int routed = 0;
         int target = -1;

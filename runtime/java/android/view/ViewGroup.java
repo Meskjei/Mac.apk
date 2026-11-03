@@ -241,6 +241,13 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         if (clipToPaddingAttr != null) setClipToPadding(clipToPaddingAttr);
     }
 
+    @Override public void dispatchWindowVisibilityChanged(int visibility) {
+        super.dispatchWindowVisibilityChanged(visibility);
+        for (View child : new java.util.ArrayList<>(children)) {
+            if (child != null) child.dispatchWindowVisibilityChanged(visibility);
+        }
+    }
+
     /** Recursive attach/detach dispatch -- self first, then children
      *  (AOSP ViewGroup.dispatchAttachedToWindow order). */
     @Override public void macapkDispatchAttachedToWindow() {
@@ -3255,6 +3262,8 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         if (idx < 0 || idx == getChildCount() - 1) return;
         children.remove(idx);
         children.add(child);
+        requestLayout();
+        invalidate();
     }
 
     /** AOSP ViewGroup.endViewTransition: signals end of a child's

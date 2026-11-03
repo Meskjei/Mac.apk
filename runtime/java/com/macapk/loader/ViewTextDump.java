@@ -83,6 +83,15 @@ import android.view.accessibility.AccessibilityNodeProvider;
 import java.util.function.Consumer;
 
 public final class ViewTextDump {
+    interface NodeSink {
+        void node(View view, Rect bounds, int depth, String window, String text, CharSequence description, boolean editable);
+    }
+    private static final ThreadLocal<NodeSink> SNAPSHOT = new ThreadLocal<>();
+    static void snapshot(View root, int statusBar, NodeSink sink) {
+        SNAPSHOT.set(sink);
+        try { dump(root, statusBar, ignored -> {}); }
+        finally { SNAPSHOT.remove(); }
+    }
     private ViewTextDump() {}
 
     public static final String TAG = "Mac.apk.TextDump";
@@ -264,6 +273,8 @@ public final class ViewTextDump {
         catch (Throwable ignored) { }
         try { drg = v.macapkHasOnDragListener() || overrides(v.getClass(), "onDragEvent", android.view.DragEvent.class); }
         catch (Throwable ignored) { }
+        NodeSink sink = SNAPSHOT.get();
+        if (sink != null) sink.node(v, new Rect(vis), depth, win, text, desc, edit);
         count[0]++;
         out.accept("NODE seq=" + seq + " win=" + win + " d=" + depth + " b=" + box(vis)
                 + " clk=" + (clk ? 1 : 0) + " lclk=" + (lclk ? 1 : 0) + " edit=" + (edit ? 1 : 0)
@@ -275,7 +286,7 @@ public final class ViewTextDump {
             try { walkProvider(prov, v, abs, vis, depth + 1, win, seq, out, count); }
             catch (Throwable t) { out.accept("VERROR seq=" + seq + " host=" + hex(v) + " " + oneLine(String.valueOf(t))); }
         }
-        if (web && WEB) requestWeb((android.webkit.WebView) v, abs, vis, seq, out);
+        if (web && WEB && SNAPSHOT.get() == null) requestWeb((android.webkit.WebView) v, abs, vis, seq, out);
     }
 
     // ---- AccessibilityNodeProvider (virtual views: Compose, ExploreByTouchHelper, custom canvases)

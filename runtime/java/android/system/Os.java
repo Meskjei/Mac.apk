@@ -17,6 +17,12 @@ import java.nio.file.attribute.PosixFileAttributes;
 public class Os {
     public Os() {}
 
+    public static void chmod(String path, int mode) throws ErrnoException {
+        java.util.Objects.requireNonNull(path, "path == null");
+        int result = com.macapk.loader.NativeOs.chmod(path, mode);
+        if (result < 0) throw new ErrnoException("chmod", -result);
+    }
+
     /** lstat — stat the *link* itself, not the target. AOSP throws
      *  ErrnoException on missing. Our impl handles symlinks via
      *  java.nio.file with NOFOLLOW_LINKS. */

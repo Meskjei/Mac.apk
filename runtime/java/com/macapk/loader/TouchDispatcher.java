@@ -1162,8 +1162,37 @@ public final class TouchDispatcher {
     // points-vs-pixels drift, which has already caused a real viewport bug once
     // (v1.0.742, HCR's "renders in the bottom-left corner").
     private static volatile int sSurfaceW = 0, sSurfaceH = 0;
-    public static void macapkNoteSurfaceSize(int wPx, int hPx) {
-        if (wPx > 0 && hPx > 0) { sSurfaceW = wPx; sSurfaceH = hPx; }
+    private static long sSurfaceEpoch;
+    public static synchronized void macapkNoteSurfaceSize(int wPx, int hPx) {
+        if (wPx > 0 && hPx > 0 && (sSurfaceW != wPx || sSurfaceH != hPx)) {
+            sSurfaceW = wPx; sSurfaceH = hPx; sSurfaceEpoch++;
+        }
+    }
+    static synchronized long[] automationGeometry() {
+        return new long[]{sSurfaceW, sSurfaceH, sSurfaceEpoch};
+    }
+    /** Complete on the input-owning thread; a timeout never means an action was not sent. */
+    static <T> T automationInput(java.util.concurrent.Callable<T> call) throws Exception {
+        if (s_instance == null || ActivityHost.peek() == null) throw new IllegalStateException("app_not_ready");
+        java.util.concurrent.FutureTask<T> task = new java.util.concurrent.FutureTask<>(call);
+        if (routeToLoop(ActivityHost.peek())) loopHandler().post(task);
+        else android.os.Handler.enqueueGlThread(task);
+        try { return task.get(5, java.util.concurrent.TimeUnit.SECONDS); }
+        catch (java.util.concurrent.TimeoutException e) {
+            task.cancel(false);
+            throw new IllegalStateException("input_timeout_result_unknown");
+        }
+    }
+    static void automationPointer(int action, float x, float y) {
+        automationPointer(ActivityHost.peek(), action, x, y);
+    }
+    static void automationPointer(Activity a, int action, float x, float y) {
+        if (a == null || s_instance == null) throw new IllegalStateException("app_not_ready");
+        if (action == MotionEvent.ACTION_DOWN) s_gestureDownTime = android.os.SystemClock.uptimeMillis();
+        HostMouseState saved = s_deliveringMouse;
+        s_deliveringMouse = null;
+        try { s_instance.dispatchSurfaceTouch(a, action, x, y, sSurfaceW, sSurfaceH, false); }
+        finally { s_deliveringMouse = saved; }
     }
 
     private static final int     MAX_HELD  = 8;

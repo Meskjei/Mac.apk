@@ -97,7 +97,7 @@ public final class MacApkGlWindow {
 
     // Readback scratch (the swapping thread only) and the recycled frames.
     private java.nio.ByteBuffer mRgba;
-    private byte[] mBytes;
+    private java.nio.IntBuffer mReadInts;
     private final java.util.concurrent.ConcurrentLinkedQueue<int[]> mFree =
         new java.util.concurrent.ConcurrentLinkedQueue<>();
     private final java.util.function.Consumer<int[]> mRecycler = mFree::offer;
@@ -175,9 +175,9 @@ public final class MacApkGlWindow {
         if (n <= 0) return;
         if (mRgba == null || mRgba.capacity() < n * 4) {
             mRgba = java.nio.ByteBuffer.allocateDirect(n * 4)
-                .order(java.nio.ByteOrder.nativeOrder());
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            mReadInts = mRgba.asIntBuffer();
         }
-        if (mBytes == null || mBytes.length < n * 4) mBytes = new byte[n * 4];
 
         final boolean es3 = clientVersion >= 3;
         final int[] v = new int[1];
@@ -214,37 +214,42 @@ public final class MacApkGlWindow {
         if (savedAlign != 4) GLES20.glPixelStorei(GL_PACK_ALIGNMENT, savedAlign);
         if (savedFb != 0) GLES20.glBindFramebuffer(fbTarget, savedFb);
 
-        mRgba.position(0);
-        mRgba.get(mBytes, 0, n * 4);
-        final byte[] b = mBytes;
-
         int[] argb = mFree.poll();
         while (argb != null && argb.length != n) argb = mFree.poll();  // a stale size: drop it
         if (argb == null) argb = new int[n];
 
-        for (int y = 0; y < h; y++) {
-            int srcRow = h - 1 - y; /*FLIP*/
-            int src = srcRow * w * 4;
-            int dst = y * w;
-            for (int x = 0; x < w; x++, src += 4) {
-                int r = b[src] & 0xff, g = b[src + 1] & 0xff;
-                int bl = b[src + 2] & 0xff, a = b[src + 3] & 0xff;
-                if (a != 0xff) {
-                    if (a == 0) {
-                        r = 0; g = 0; bl = 0;
-                    } else {
-                        r = unpremul(r, a);
-                        g = unpremul(g, a);
-                        bl = unpremul(bl, a);
-                    }
-                }
-                argb[dst + x] = (a << 24) | (r << 16) | (g << 8) | bl;
-            }
-        }
+        copyReadback(mReadInts, argb, w, h);
         // premultipliedSource=true: a GL consumer (updateTexImage) must see the
         // premultiplied bytes a device buffer holds, not our straight copy.
         mSt.macapkQueueProducerFrame(argb, w, h, w, FLIP_V, mRecycler, true); /*GLPREMUL*/
         mFrames++;
+    }
+
+    // Read straight into the recycled destination, avoiding a full-frame byte[]
+    // staging copy. Paired rows convert and flip in place without another buffer.
+    static void copyReadback(java.nio.IntBuffer rgba, int[] argb, int width, int height) {
+        rgba.position(0);
+        rgba.get(argb, 0, width * height);
+        for (int y = 0; y < height / 2; y++) {
+            int top = y * width, bottom = (height - 1 - y) * width;
+            for (int x = 0; x < width; x++) {
+                int a = argb[top + x], b = argb[bottom + x];
+                argb[top + x] = straightArgb(b);
+                argb[bottom + x] = straightArgb(a);
+            }
+        }
+        if ((height & 1) != 0) {
+            int row = (height / 2) * width;
+            for (int x = 0; x < width; x++) argb[row + x] = straightArgb(argb[row + x]);
+        }
+    }
+
+    private static int straightArgb(int rgba) {
+        int a = rgba >>> 24;
+        if (a == 0) return 0;
+        if (a == 255) return (rgba & 0xff00ff00) | ((rgba & 255) << 16) | ((rgba >>> 16) & 255);
+        int r = unpremul(rgba & 255, a), g = unpremul((rgba >>> 8) & 255, a), b = unpremul((rgba >>> 16) & 255, a);
+        return (a << 24) | (r << 16) | (g << 8) | b;
     }
 
     /** Premultiplied channel back to straight alpha, rounded to nearest. */

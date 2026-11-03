@@ -119,7 +119,7 @@ public class RecordingCanvas extends Canvas {
     }
 
     // ---- Canvas management ---------------------------------------------------
-    @Override public boolean isHardwareAccelerated() { return true; }
+    @Override public boolean isHardwareAccelerated() { return super.isHardwareAccelerated(); }
 
     /** AOSP RecordingCanvas.setBitmap throws UnsupportedOperationException: a
      *  display list has no pixels to retarget. Bitmap mode keeps the pre-change

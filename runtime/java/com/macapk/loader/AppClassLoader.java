@@ -1263,6 +1263,12 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
     // dalvik.system.BaseDexClassLoader.findLibrary).
     @Override
     public String findLibrary(String libname) {
+        if (libname == null || libname.contains("/") || libname.contains("\\")) return null;
+        File artifact = locateApkSo(libname);
+        // SDKs also use findLibrary to locate DEX/plugin archives named lib*.so.
+        // Preserve their bytes and path; System.load can reject non-code normally.
+        if (artifact != null && !hasElfMagic(artifact)) return artifact.getAbsolutePath();
+        requireNativeProfileSupport("lib" + libname + ".so");
         // v1.0.152: on the first findLibrary call, pre-translate every
         // other .so in the APK's lib/<abi>/ dir so downstream dlopen()
         // calls from within native code can find them. Unity's libmain.so
@@ -2623,6 +2629,71 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
      *  hide it. */
     private static final java.util.concurrent.atomic.AtomicInteger overlayRefs =
         new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** Dynamic DEX loaders also carry native search paths, outside the APK lib dir. */
+    public static String resolveNativeCodePath(ClassLoader owner, File source) {
+        if (!hasElfMagic(source)) return source.getAbsolutePath();
+        requireNativeProfileSupport(source.getName(), source);
+        AppClassLoader app = null;
+        for (ClassLoader loader = owner; loader != null; loader = loader.getParent()) {
+            if (loader instanceof AppClassLoader) { app = (AppClassLoader)loader; break; }
+        }
+        if (app == null) {
+            for (ClassLoader loader = Thread.currentThread().getContextClassLoader(); loader != null; loader = loader.getParent()) {
+                if (loader instanceof AppClassLoader) { app = (AppClassLoader)loader; break; }
+            }
+        }
+        // Outside Mac.apk this remains the ordinary ClassLoader path contract.
+        if (app == null) return source.getAbsolutePath();
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            digest.update(source.getCanonicalPath().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            digest.update((byte)0);
+            try (var input = new java.io.BufferedInputStream(new java.io.FileInputStream(source))) {
+                byte[] bytes = new byte[65536];
+                for (int n; (n = input.read(bytes)) != -1;) digest.update(bytes, 0, n);
+            }
+            File cacheDir = new File(app.appDir, "lib_native/external-" + java.util.HexFormat.of().formatHex(digest.digest()));
+            if (!cacheDir.isDirectory() && !cacheDir.mkdirs()) throw new java.io.IOException("cannot create native code cache");
+            File output = new File(cacheDir, source.getName() + ".dylib");
+            synchronized (app.pretranslateLock) {
+                if (!output.isFile() || !app.nativeIdMatches(output)) {
+                    if (!app.translate(source, output)) throw new java.io.IOException("dynamic native translation failed");
+                    writeNativeIdStamp(output);
+                }
+            }
+            return output.getAbsolutePath();
+        } catch (Exception error) {
+            UnsatisfiedLinkError failure = new UnsatisfiedLinkError("Cannot load dynamic native library " + source.getName());
+            failure.initCause(error);
+            throw failure;
+        }
+    }
+
+    // Explicit experimental profile exclusions fail before dlopen/JNI_OnLoad;
+    // the app observes an actual load failure, never a no-op success stub.
+    private static void requireNativeProfileSupport(String filename) {
+        requireNativeProfileSupport(filename, null);
+    }
+
+    private static void requireNativeProfileSupport(String filename, File source) {
+        String unsupported = System.getenv("MACAPK_UNSUPPORTED_NATIVE_LIBS");
+        if (unsupported == null || unsupported.isBlank()) return;
+        for (String name : unsupported.split(",")) {
+            String excluded = name.trim();
+            if (filename.equals(excluded) || (source != null && source.getAbsolutePath().equals(excluded)))
+                throw new UnsatisfiedLinkError("Native library unsupported by this runtime profile: " + filename);
+        }
+    }
+
+    private static boolean hasElfMagic(File file) {
+        try (var input = new java.io.FileInputStream(file)) {
+            return java.util.Arrays.equals(input.readNBytes(4), new byte[]{0x7f, 'E', 'L', 'F'});
+        } catch (java.io.IOException unreadable) {
+            // Return the original path: a real load reports the original I/O failure.
+            return false;
+        }
+    }
 
     /** Run the macapk-translator subprocess. Returns true on success.
      *

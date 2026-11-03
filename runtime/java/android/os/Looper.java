@@ -874,15 +874,17 @@ public final class Looper {
         q.setWaker(MAIN::wakeNative);
         android.util.Log.i("Looper", "MACAPK_REAL_LOOPER: main loop blocks in the native poll"
             + " (MACAPK_MAIN_NATIVE_POLL) nativeLooper=0x" + Long.toHexString(nl));
-        // Claim the looper before the first dispatch: LAUNCH_ACTIVITY is already
-        // queued, and an fd its onCreate registers must never be adopted.
-        try { com.macapk.loader.NativeLooper.pollOnce(nl, 0); } catch (Throwable ignored) { }
         long n = 0;
         boolean idledThisBlock = false;
         for (;;) {
-            Message msg;
             boolean dispatched = false;
-            while ((msg = q.macapkPollDue()) != null) {
+            for (;;) {
+                // AOSP polls before selecting each message. A continuously busy
+                // Java queue must still service native IPC on its owner thread.
+                try { com.macapk.loader.NativeLooper.pollOnce(nl, 0); }
+                catch (Throwable ignored) { }
+                Message msg = q.macapkPollDue();
+                if (msg == null) break;
                 dispatched = true;
                 n++;
                 try {
@@ -899,13 +901,7 @@ public final class Looper {
             if (dispatched) idledThisBlock = false;
             if (q.isQuitting()) break;
             int timeout = q.nextPollTimeoutMillis();
-            if (timeout == 0) {
-                // AOSP calls nativePollOnce(ptr, 0) on every pass, so a busy main
-                // queue still services its fds.
-                try { com.macapk.loader.NativeLooper.pollOnce(nl, 0); }
-                catch (Throwable ignored) { }
-                continue;
-            }
+            if (timeout == 0) continue;
             if (!idledThisBlock) {
                 idledThisBlock = true;
                 if (q.runIdleHandlers()) continue;

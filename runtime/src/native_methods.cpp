@@ -219,6 +219,8 @@ jint Cocoa_windowOverrideOrientation(JNIEnv* env, jclass, jstring component,
                                                             static_cast<int>(record_orientation)));
 }
 
+jboolean Cocoa_lockViewport(JNIEnv*, jclass) { return CocoaLockViewport() ? JNI_TRUE : JNI_FALSE; }
+jboolean Cocoa_viewportFixed(JNIEnv*, jclass) { return CocoaViewportFixed() ? JNI_TRUE : JNI_FALSE; }
 jint Cocoa_phoneWidth(JNIEnv*, jclass)  { return CocoaPhoneWidth();  }
 jint Cocoa_displayHz(JNIEnv*, jclass)   { return CocoaDisplayHz();  }
 jfloat Cocoa_backingScale(JNIEnv*, jclass) { return CocoaBackingScale(); }
@@ -784,6 +786,8 @@ const JNINativeMethod kNativeCocoaMethods[] = {
      reinterpret_cast<void*>(Cocoa_applyWindowOrientationFor)},
     {const_cast<char*>("windowOverrideOrientation"), const_cast<char*>("(Ljava/lang/String;I)I"),
      reinterpret_cast<void*>(Cocoa_windowOverrideOrientation)},
+    {const_cast<char*>("lockViewport"), const_cast<char*>("()Z"), reinterpret_cast<void*>(Cocoa_lockViewport)},
+    {const_cast<char*>("viewportFixed"), const_cast<char*>("()Z"), reinterpret_cast<void*>(Cocoa_viewportFixed)},
     {const_cast<char*>("phoneWidth"),             const_cast<char*>("()I"),
      reinterpret_cast<void*>(Cocoa_phoneWidth)},
     {const_cast<char*>("displayHz"),              const_cast<char*>("()I"),
@@ -3349,6 +3353,41 @@ extern "C" void* __macapk_egl14_window_resolve(void* dpy, void* surf) {
 }
 extern "C" int __macapk_egl14_window_swap(void* dpy, void* surf) {
     return egl14_native_swap(dpy, surf);
+}
+extern "C" void* __macapk_egl14_window_create(JNIEnv* env, void* dpy, void* cfg,
+                                              jobject window, const int32_t* attribs) {
+    jintArray attributes = nullptr;
+    if (attribs) {
+        size_t n = 0;
+        while (n < 128 && attribs[n] != 0x3038 /*EGL_NONE*/) n += 2;
+        if (n >= 128) { t_egl14PendingError = 0x3004 /*EGL_BAD_ATTRIBUTE*/; return nullptr; }
+        attributes = env->NewIntArray(static_cast<jsize>(n + 1));
+        if (attributes) env->SetIntArrayRegion(attributes, 0, static_cast<jsize>(n + 1), attribs);
+    }
+    if (env->ExceptionCheck()) return nullptr;
+    jobject display = boxDisplay(env, dpy);
+    jobject config = boxConfig(env, cfg);
+    jobject result = EGL14_eglCreateWindowSurface(env, nullptr, display, config,
+                                                 window, attributes, 0);
+    void* handle = result && !env->ExceptionCheck()
+        ? reinterpret_cast<void*>(static_cast<intptr_t>(env->CallLongMethod(result, g_eglGetNativeHandle)))
+        : nullptr;
+    if (result) env->DeleteLocalRef(result);
+    if (attributes) env->DeleteLocalRef(attributes);
+    if (config) env->DeleteLocalRef(config);
+    if (display) env->DeleteLocalRef(display);
+    return handle;
+}
+extern "C" int __macapk_egl14_window_destroy(JNIEnv* env, void* dpy, void* surf) {
+    Egl14Win window;
+    if (!egl14_win_take(dpy, surf, &window)) return -1;
+    jboolean result = JNI_FALSE;
+    return egl14_win_destroy(env, window, &result) && result ? 1 : 0;
+}
+extern "C" int __macapk_egl14_window_error() {
+    int error = t_egl14PendingError;
+    t_egl14PendingError = 0;
+    return error;
 }
 
 namespace {

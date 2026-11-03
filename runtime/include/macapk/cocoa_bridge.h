@@ -56,6 +56,8 @@ void CocoaRestoreUserOrientation();
 // is on, clamped to MACAPK_MAX_FPS (default 120). Callable from any thread. See the long comment
 // at MacapkPanelHz -- this is the SINGLE source of the rate for the present cadence, the guest
 // drive cadence, and android.view.Display.getRefreshRate(); they must not diverge (v1.0.568).
+bool CocoaLockViewport();    // freeze the ready automation canvas, only with MACAPK_FIXED_VIEWPORT=1
+bool CocoaViewportFixed();   // false if geometry or backing scale changed after locking
 float CocoaBackingScale();   // real window backing scale; input mapping used a hardcoded 2.0f
 // The process's display density (v1.0.2187): the launch screen's backing scale in
 // dpi -- 320 on Retina, 160 on a 1x monitor -- or MACAPK_DISPLAY_DENSITY. Decided

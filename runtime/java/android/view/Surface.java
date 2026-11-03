@@ -149,8 +149,10 @@ public class Surface implements android.os.Parcelable {
         if (mCanvasLocked) {
             throw new IllegalArgumentException("Surface was already locked");
         }
-        int w = defaultWidth();
-        int h = defaultHeight();
+        int w = mSurfaceTexture != null ? mSurfaceTexture.macapkGetDefaultWidth() : 0;
+        int h = mSurfaceTexture != null ? mSurfaceTexture.macapkGetDefaultHeight() : 0;
+        if (w <= 0) w = defaultWidth();
+        if (h <= 0) h = defaultHeight();
         if (mDrawBitmap == null || mDrawBitmap.getWidth() != w || mDrawBitmap.getHeight() != h) {
             mDrawBitmap = android.graphics.Bitmap.createBitmapWithCanvasBacking(w, h);
             mDrawCanvas = new android.graphics.Canvas(mDrawBitmap);
@@ -184,6 +186,15 @@ public class Surface implements android.os.Parcelable {
         int[] pixels = mDrawBitmap.macapkLiveArgbOrNull();
         if (pixels == null) pixels = mDrawBitmap.macapkArgbBuffer();
         if (pixels == null) return;
+        if (mSurfaceTexture != null) {
+            // A Surface(SurfaceTexture) produces into that texture's queue,
+            // not the main window. Keep a snapshot: the next lock reuses the
+            // canvas backing while a GL/TextureView consumer may latch later.
+            mSurfaceTexture.macapkQueueProducerFrame(pixels.clone(),
+                mDrawBitmap.getWidth(), mDrawBitmap.getHeight(),
+                mDrawBitmap.getWidth(), null, null, false);
+            return;
+        }
         try {
             com.macapk.loader.NativeCocoa.presentBitmap(
                 pixels, mDrawBitmap.getWidth(), mDrawBitmap.getHeight());

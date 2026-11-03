@@ -343,7 +343,12 @@ public class Canvas {
      *  offscreen bitmap with the node's transform/clip/alpha), reporting
      *  true completes the record->replay chain. v1.0.124 set this false
      *  because drawRenderNode didn't exist yet; that's no longer true. */
-    public boolean isHardwareAccelerated() { return true; }
+    // Explicit compatibility profile for engines with a software platform-view
+    // fallback but unsupported external-texture composition. Default stays on
+    // for Compose's hardware RenderNode record/replay contract above.
+    private static final boolean MACAPK_SOFTWARE_CANVAS =
+        "1".equals(System.getenv("MACAPK_SOFTWARE_CANVAS"));
+    public boolean isHardwareAccelerated() { return !MACAPK_SOFTWARE_CANVAS; }
     /** AOSP `Canvas.getDensity` -- in DPI per inch. Used by some
      *  drawing paths to scale stroke widths / text sizes. Default
      *  unscaled = 160 (the AOSP "medium DPI" baseline). */
@@ -1139,11 +1144,10 @@ public class Canvas {
     // every shape shadow (card outline, badge circle, chart bar) silently
     // vanished.
     //
-    // The technique is the one drawText already uses: paint the same geometry
-    // once in the shadow color at the +dx/+dy offset, plus a 1px cardinal spread
-    // when a blur radius is set so the edge reads feathered rather than as a
-    // hard duplicate. Everything is guarded on hasShadowLayer(), so a paint
-    // without a shadow renders byte-identically to before and allocates nothing.
+    // Blur one coverage mask, as the text-shadow path does, and composite it
+    // once at +dx/+dy. Repeated hard stamps both ignored the requested radius
+    // and accumulated alpha, turning a faint shadow into a dark rectangle.
+    // Paints without a shadow render unchanged and allocate nothing here.
     private static boolean hasShadow(Paint p) {
         try { return p != null && p.hasShadowLayer(); } catch (Throwable t) { return false; }
     }
@@ -1164,13 +1168,8 @@ public class Canvas {
                 g.setStroke(macapkStrokeFor(p, sw));
             }
             g.translate((double) p.getShadowDx(), (double) p.getShadowDy());
+            if (p.getShadowRadius() > 0f && macapkDrawBlurredShapeShadow(s, p, stroke)) return;
             shadowPass(s, stroke);
-            if (p.getShadowRadius() >= 1f) {
-                g.translate(1d, 0d);   shadowPass(s, stroke);
-                g.translate(-2d, 0d);  shadowPass(s, stroke);
-                g.translate(1d, 1d);   shadowPass(s, stroke);
-                g.translate(0d, -2d);  shadowPass(s, stroke);
-            }
         } catch (Throwable t) {
             com.macapk.loader.GfxTrace.swallow("Canvas.drawShapeShadow", t);
         } finally {
@@ -1182,6 +1181,39 @@ public class Canvas {
     }
     private void shadowPass(Shape s, boolean stroke) {
         if (stroke) g.draw(s); else g.fill(s);
+    }
+
+    private boolean macapkDrawBlurredShapeShadow(Shape shape, Paint paint, boolean stroke) {
+        Shape mask = stroke ? g.getStroke().createStrokedShape(shape) : shape;
+        java.awt.geom.Rectangle2D bounds = mask.getBounds2D();
+        if (bounds.isEmpty()) return true;
+        // Share the bounded, linear-time alpha blur used by text shadows.
+        float sigma = paint.getShadowRadius() * 0.57735f + 0.5f;
+        int box = Math.max(1, Math.min(16, Math.round(sigma)));
+        int pad = box * 3 + 2;
+        double left = Math.floor(bounds.getMinX()) - pad;
+        double top = Math.floor(bounds.getMinY()) - pad;
+        double width = Math.ceil(bounds.getMaxX()) - left + pad;
+        double height = Math.ceil(bounds.getMaxY()) - top + pad;
+        if (!Double.isFinite(left) || !Double.isFinite(top)
+                || !(width > 0) || !(height > 0) || width * height > 2000000L) return false;
+        int iw = (int) width, ih = (int) height;
+        BufferedImage image = new BufferedImage(iw, ih, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D maskGraphics = image.createGraphics();
+        try {
+            maskGraphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                paint.isAntiAlias() ? RenderingHints.VALUE_ANTIALIAS_ON : RenderingHints.VALUE_ANTIALIAS_OFF);
+            maskGraphics.translate(-left, -top);
+            maskGraphics.setColor(toAwtColor(paint.getShadowColor()));
+            maskGraphics.fill(mask);
+        } finally {
+            maskGraphics.dispose();
+        }
+        int[] pixels = image.getRGB(0, 0, iw, ih, null, 0, iw);
+        macapkBoxBlurAlpha(pixels, iw, ih, box, paint.getShadowColor() & 0x00ffffff);
+        image.setRGB(0, 0, iw, ih, pixels, 0, iw);
+        g.drawImage(image, AffineTransform.getTranslateInstance(left, top), null);
+        return true;
     }
 
     // --- Primitive shapes --------------------------------------------

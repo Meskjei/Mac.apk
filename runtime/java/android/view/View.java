@@ -1848,6 +1848,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  and ViewGroup.addView dispatches recursively when the parent
      *  is already attached. */
     boolean macapkAttached = false;
+    private int macapkWindowVisibility = VISIBLE;
     public boolean isAttachedToWindow()                { return macapkAttached; }
     private static boolean warnedAttachThrow = false;
     private static boolean warnedSizeChanged = false;
@@ -1871,6 +1872,8 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         macapkTraceComposeAttach("ATTACH", macapkAttached);
         if (macapkAttached) return;
         macapkAttached = true;
+        macapkWindowVisibility = getParent() instanceof View
+            ? ((View) getParent()).getWindowVisibility() : VISIBLE;
         // hasWindowFocus() flips false -> true at this moment (it gates on
         // macapkAttached since the fwprobe DRAWSTATE fix), so any drawable
         // state cached during construction is stale now. AOSP recomputes via
@@ -1935,6 +1938,10 @@ public class View implements android.graphics.drawable.Drawable.Callback,
                     + ": " + t + "\n" + sw);
             }
         }
+        // AOSP delivers the window's visibility after attach; WebView waits for it
+        // before making its compositor visible.
+        try { onWindowVisibilityChanged(getWindowVisibility()); }
+        catch (Throwable t) { com.macapk.loader.NativeLog.w("View", "window visibility callback: " + t); }
         if (attachStateChangeListeners != null) {
             for (OnAttachStateChangeListener l :
                     new java.util.ArrayList<>(attachStateChangeListeners)) {
@@ -2883,10 +2890,13 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  WindowOverlayStack dispatches attach. */
     public int getWindowVisibility() {
         if (!sIsShownDetachedAosp) return VISIBLE;
-        return macapkAttached ? VISIBLE : GONE;
+        return macapkAttached ? macapkWindowVisibility : GONE;
     }
     public void onWindowVisibilityChanged(int visibility) {}
-    public void dispatchWindowVisibilityChanged(int visibility) {}
+    public void dispatchWindowVisibilityChanged(int visibility) {
+        macapkWindowVisibility = visibility;
+        onWindowVisibilityChanged(visibility);
+    }
     public void onWindowFocusChanged(boolean hasFocus) {}
     /** AOSP View.dispatchWindowFocusChanged: deliver to this view; ViewGroup
      *  overrides to recurse into children. */
@@ -3143,16 +3153,11 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     }
     public void setOnGenericMotionListener(OnGenericMotionListener listener, Object discriminator) {}
     public void bringToFront() {
-        // re-parent to last position so default draw order paints
-        // this view on top of siblings.
+        // Reorder inside the same parent. Removing/re-adding dispatches detach
+        // callbacks (and app state cleanup) even though the view never left
+        // its window; Shangou's HomeTab resets its selection in that callback.
         ViewParent p = getParent();
-        if (p instanceof ViewGroup vg) {
-            int idx = vg.indexOfChild(this);
-            if (idx >= 0 && idx < vg.getChildCount() - 1) {
-                vg.removeView(this);
-                vg.addView(this);
-            }
-        }
+        if (p != null) p.bringChildToFront(this);
     }
     // v1.0.685: getAnimation/setAnimation round-trip through a real field.
     // The animation is not vsync-driven here, but AOSP's contract is that
@@ -5723,10 +5728,9 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  Each widget gets the AOSP-spec fill + shape + shadow before
      *  the View's own children paint over it.
      *
-     *  Detection rules (all class simple-name matching so we work
-     *  whether the widget is androidx.cardview / com.google.android.
-     *  material / a subclass thereof):
-     *    - "*CardView"            -> 12dp rounded white fill + 4px elevation shadow
+     *  Cards are detected by their actual type hierarchy; the other legacy
+     *  widget fallbacks below retain their simple-name matching:
+     *    - AndroidX/Material CardView subclasses -> rounded card fallback
      *    - "FloatingActionButton" -> 16dp rounded-square teal fill + 6dp shadow
      *    - "BottomNavigationView" / "NavigationBarView" -> opaque surface fill
      *
@@ -5755,6 +5759,25 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         macapkPaintMaterialChrome(canvas, w, h);
     }
 
+    private static final ClassValue<Boolean> MACAPK_CARD_WIDGET_TYPES = new ClassValue<>() {
+        @Override protected Boolean computeValue(Class<?> type) {
+            for (Class<?> current = type; current != null && current != View.class;
+                    current = current.getSuperclass()) {
+                String name = current.getName();
+                if (name.equals("androidx.cardview.widget.CardView")
+                        || name.equals("android.support.v7.widget.CardView")
+                        || name.equals("com.google.android.material.card.MaterialCardView")) return true;
+            }
+            return false;
+        }
+    };
+
+    private boolean macapkIsCardWidget() {
+        // App widgets named *CardView can be transparent containers with their
+        // own rendering; a name suffix does not authorize extra chrome or clip.
+        return MACAPK_CARD_WIDGET_TYPES.get(getClass());
+    }
+
     /** v1.0.406: if this view is a (Material)CardView, save the canvas and clip
      *  to the card's rounded outline (radius from shapeAppearanceMediumComponent,
      *  same as the chrome fill) so its children can't overhang the rounded
@@ -5765,7 +5788,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         try {
             if (canvas == null) return -1;
             if ("0".equals(ENV_MACAPK_CARD_CLIP)) return -1;
-            if (!getClass().getSimpleName().endsWith("CardView")) return -1;
+            if (!macapkIsCardWidget()) return -1;
             int w = right - left, h = bottom - top;
             if (w <= 0 || h <= 0) return -1;
             int density = Math.max(1, Math.round(android.util.DisplayMetrics.macapkDeviceDensity()));
@@ -5832,7 +5855,7 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         // to come from a stroke. Material3 Outlined CardView uses this
         // exact pattern (1dp outline at colorOutlineVariant); we apply
         // it to all CardView variants for visible boundaries.
-        if (name.endsWith("CardView")) {
+        if (macapkIsCardWidget()) {
             int density = Math.max(1, Math.round(android.util.DisplayMetrics.macapkDeviceDensity()));
             try {
                 if (this.getResources() != null
