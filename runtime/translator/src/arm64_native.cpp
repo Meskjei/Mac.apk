@@ -12178,6 +12178,44 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
     // misses the epilogue load done through the copy.
     bool func_has_tpidr_mrs = false;
 
+    uintptr_t stkchk_stub = 0;
+    auto is_bl_to = [](const uint32_t* ip, uintptr_t target) -> bool {
+        if ((*ip & 0xFC000000u) != 0x94000000u) return false;
+        int64_t off = int64_t(int32_t(uint32_t(*ip) << 6) >> 6) * 4;
+        return reinterpret_cast<uintptr_t>(ip) + off == target;
+    };
+    auto reaches_stack_chk_fail = [&](uint32_t* branch, uint32_t* lo,
+                                       uint32_t* end) -> bool {
+        if (!stkchk_stub || !branch) return false;
+        // Follow short shared failure thunks, but never another conditional check.
+        auto fail_path = [&](uintptr_t pc) {
+            for (int budget = 0; budget < 6; ++budget) {
+                if (pc < reinterpret_cast<uintptr_t>(lo)
+                    || pc >= reinterpret_cast<uintptr_t>(end)) return false;
+                if (pc == stkchk_stub) return true; // tail call
+                auto* p = reinterpret_cast<uint32_t*>(pc);
+                uint32_t insn = *p;
+                if (is_bl_to(p, stkchk_stub)) return true;
+                if ((insn & 0xFC000000u) == 0x14000000u) { // b
+                    int64_t off = int64_t(int32_t(insn << 6) >> 6) * 4;
+                    pc = uintptr_t(int64_t(pc) + off);
+                    continue;
+                }
+                if ((insn & 0xFC000000u) == 0x94000000u  // other call
+                    || (insn & 0xFF000010u) == 0x54000000u // b.cond
+                    || (insn & 0x7E000000u) == 0x34000000u // cbz/cbnz
+                    || (insn & 0x7E000000u) == 0x36000000u // tbz/tbnz
+                    || (insn & 0xFE000000u) == 0xD6000000u) return false; // indirect/ret
+                pc += 4;
+            }
+            return false;
+        };
+        int32_t offset = int32_t(((*branch >> 5) & 0x7ffffu) << 13) >> 13;
+        uintptr_t pc = reinterpret_cast<uintptr_t>(branch);
+        return fail_path(uintptr_t(int64_t(pc) + int64_t(offset) * 4))
+            || fail_path(pc + 4);
+    };
+
     // Recognise the stack-canary epilogue CHECK reachable from a `ldr Xt,[Xn,#0x28]`
     // at `p`: within a short window, a reload of the spilled guard
     // `ldr Xu,[sp,#M]` (Xu != Xt) followed by `cmp Xt,Xu` (64-bit SUBS, Rd=XZR)
@@ -12356,7 +12394,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
         return !e || *e != '0';   // default ON
     }();
 
-    auto epilogue_guard_check = [](uint32_t* p, uint32_t* lo, uint32_t* end,
+    auto epilogue_guard_check = [&](uint32_t* p, uint32_t* lo, uint32_t* end,
                                    uint32_t xt) -> bool {
         uint32_t* q = p + 1;              // first instruction after the guard ldr
         int follow_budget = 1;            // hops across at most one unconditional `b`
@@ -12396,7 +12434,8 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
                         && (rn == xt || rm == xt)
                         && (rn == (uint32_t)sp_loaded || rm == (uint32_t)sp_loaded)) {
                         for (int m = 1; m <= 2 && (q + k + m) < end; ++m)
-                            if ((*(q + k + m) & 0xFF000010u) == 0x54000000u) return true;  // b.cond
+                            if ((*(q + k + m) & 0xFF000010u) == 0x54000000u)
+                                return reaches_stack_chk_fail(q + k + m, lo, end);
                         return false;
                     }
                     continue;   // a DIFFERENT compare (e.g. the return-value cmp that
@@ -12616,7 +12655,6 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
     // the DEFINITIVE proof that a preceding `ldr Xt,[Xn,#0x28]` was a canary
     // read. (Moved above pass 1 in v1.0.999 so the outlined-compare backstop can
     // use it; previously resolved only before pass 2.)
-    uintptr_t stkchk_stub = 0;
     if (pltrel_ && symtab_ && strtab_) {
         uintptr_t got_slot = 0;
         for (size_t i = 0; i < pltrel_count_; ++i) {
@@ -12653,13 +12691,6 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
             }
         }
     }
-    // True iff *ip is `bl <target>`.
-    auto is_bl_to = [](const uint32_t* ip, uintptr_t target) -> bool {
-        if ((*ip & 0xFC000000u) != 0x94000000u) return false;
-        int64_t off = int64_t(int32_t(uint32_t(*ip) << 6) >> 6) * 4;
-        return reinterpret_cast<uintptr_t>(ip) + off == target;
-    };
-
     // OUTLINED-COMPARE backstop (see kOutlinedMrs). The LLVM machine outliner
     // can factor BOTH the canary compare AND the mrs into helpers, and can
     // ENTER a function body via a tail `b` from an mrs helper. Then:
@@ -12712,13 +12743,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
         // fall-through must reach `bl __stack_chk_fail` within a few insns.
         uint32_t* bc = p + 2;
         if ((*bc & 0xFF000010u) != 0x54000000u) return false;   // b.cond
-        int32_t imm19 = int32_t(uint32_t(((*bc >> 5) & 0x7FFFFu)) << 13) >> 13;
-        uint32_t* tgt = bc + imm19;
-        for (uint32_t* k = tgt; k >= seg_lo && k < seg_end && k < tgt + 3; ++k)
-            if (is_bl_to(k, stkchk_stub)) return true;
-        for (uint32_t* k = bc + 1; k < seg_end && k < bc + 3; ++k)
-            if (is_bl_to(k, stkchk_stub)) return true;
-        return false;
+        return reaches_stack_chk_fail(bc, seg_lo, seg_end);
     };
 
     ct_lap("canary setup (stub resolve, lambdas)");
@@ -13257,7 +13282,10 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
                         // Xt must stay pristine until the canary cmp.
                         if ((zi & 0x1Fu) == rt || ((zi >> 5) & 0x1Fu) == rt ||
                             ((zi >> 16) & 0x1Fu) == rt) break;
-                        if ((zi & 0xFFC00000u) == 0xF9400000u) {       // ldr Xd,[_,#imm]
+                        if ((zi & 0xFFC00000u) == 0xF9400000u        // ldr Xd,[_,#imm]
+                            || ((zi & 0xFFE00C00u) == 0xF8400000u   // ldur Xd,[fp/sp,#imm]
+                                && (((zi >> 5) & 0x1Fu) == 29u
+                                    || ((zi >> 5) & 0x1Fu) == 31u))) {
                             rs_ldr = int(zi & 0x1Fu);
                             rs_ldr_base = (zi >> 5) & 0x1Fu;
                         }
@@ -13284,13 +13312,7 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
                         (rn == 29u || rn == 31u) &&
                         rs_ldr_base != 29u && rs_ldr_base != 31u;
                     if (ok && mbc && !global_guard_saved_reload) {
-                        bool anch = false;
-                        int32_t imm19 = int32_t(uint32_t(((*mbc >> 5) & 0x7FFFFu)) << 13) >> 13;
-                        uint32_t* tgt = mbc + imm19;
-                        for (uint32_t* k = tgt; k >= lo && k < end && k < tgt + 3; ++k)
-                            if (is_bl_to(k, stkchk_stub)) { anch = true; break; }
-                        for (uint32_t* k = mbc + 1; !anch && k < end && k < mbc + 3; ++k)
-                            if (is_bl_to(k, stkchk_stub)) { anch = true; break; }
+                        bool anch = reaches_stack_chk_fail(mbc, lo, end);
                         if (anch) {
                             if (kCanaryTrace)
                                 std::fprintf(stderr,
@@ -13370,26 +13392,9 @@ size_t Image::apply_stack_canary_neutralization_live(size_t* tp_zeroed_out) {
             }
             if (!canary) continue;           // legitimate field load: leave it
 
-            // x29/sp base: demand the definitive signature -- the
-            // mismatch branch (taken target or fall-through) reaches
-            // __stack_chk_fail. This admits the spilled-thread-pointer
-            // canary while still rejecting any ordinary two-local
-            // compare that happens to read [x29,#0x28].
-            if (base_is_fp_or_sp) {
-                bool anchored = false;
-                if (bcond) {
-                    int32_t imm19 = int32_t(
-                        uint32_t(((*bcond >> 5) & 0x7FFFFu)) << 13) >> 13;
-                    uint32_t* tgt = bcond + imm19;
-                    for (uint32_t* k = tgt;
-                         k >= lo && k < end && k < tgt + 3; ++k)
-                        if (is_bl_to(k, stkchk_stub)) { anchored = true; break; }
-                    for (uint32_t* k = bcond + 1;
-                         !anchored && k < end && k < bcond + 3; ++k)
-                        if (is_bl_to(k, stkchk_stub)) { anchored = true; break; }
-                }
-                if (!anchored) continue;     // not a canary: leave it
-            }
+            // Ordinary object fields can also be compared against stack locals.
+            // UC's GPU scheduler uses this shape for its task-runner pointer.
+            if (!reaches_stack_chk_fail(bcond, lo, end)) continue;
 
             if (kCanaryTrace)
                 std::fprintf(stderr,
