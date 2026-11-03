@@ -2788,7 +2788,10 @@ public final class TouchDispatcher {
         deliverWheelToWindows(a, ev);
     }
 
+    private final HostPointerQueue hostPointerQueue = new HostPointerQueue(task -> loopHandler().post(task));
+
     public void dispatch(int action, float x, float y, float viewW, float viewH) {
+        final long eventTime = android.os.SystemClock.uptimeMillis();
         noteRealInput();
         if (TRACKPAD_MULTITOUCH) {
             // The host mouse (or the synthesized scroll drag) starts a stream:
@@ -2803,12 +2806,16 @@ public final class TouchDispatcher {
             }
         }
         if (routeToLoop(ActivityHost.peek())) {
-            loopHandler().post(() -> doDispatch(action, x, y, viewW, viewH));
+            hostPointerQueue.enqueue(action, () -> doDispatch(action, x, y, viewW, viewH, eventTime));
             return;
         }
-        doDispatch(action, x, y, viewW, viewH);
+        doDispatch(action, x, y, viewW, viewH, eventTime);
     }
     private void doDispatch(int action, float x, float y, float viewW, float viewH) {
+        doDispatch(action, x, y, viewW, viewH, android.os.SystemClock.uptimeMillis());
+    }
+
+    private void doDispatch(int action, float x, float y, float viewW, float viewH, long eventTime) {
         // Input recorder (docs/input-recorder_2026-10-01.md), AT DELIVERY: on the
         // thread that hands the event to the app, in the loop's FIFO order -- which
         // is also where the trackpad claim's CANCEL (queued by dispatch() above,
@@ -2843,7 +2850,7 @@ public final class TouchDispatcher {
         // belongs to. Every event of one press-drag-release then carries the
         // same downTime, which is what long-press and fling classification
         // read.
-        if (action == 0 /* DOWN */) s_gestureDownTime = android.os.SystemClock.uptimeMillis();
+        if (action == 0 /* DOWN */) s_gestureDownTime = eventTime;
 
         // The drawable's real backing scale (was hardcoded 2.0f -- correct on retina, but on a 1x
         // external display every touch landed at twice its true coordinate). See macapkBackingScale.
@@ -2851,7 +2858,7 @@ public final class TouchDispatcher {
         float px = x * scale;
         float py = (viewH - y) * scale;  // Y-flip: Cocoa origin bottom -> Android origin top
         dispatchSurfaceTouch(active, action, px, py,
-                Math.round(viewW * scale), Math.round(viewH * scale), logThis);
+                Math.round(viewW * scale), Math.round(viewH * scale), logThis, eventTime);
     }
 
     /** Everything a host mouse event does once it is in SURFACE pixels
@@ -2878,6 +2885,11 @@ public final class TouchDispatcher {
 
     private void dispatchSurfaceTouch(Activity active, int action, float px, float py,
                                       int surfW, int surfH, boolean logThis) {
+        dispatchSurfaceTouch(active, action, px, py, surfW, surfH, logThis, android.os.SystemClock.uptimeMillis());
+    }
+
+    private void dispatchSurfaceTouch(Activity active, int action, float px, float py,
+                                      int surfW, int surfH, boolean logThis, long eventTime) {
         // GATE-MUTANT(touchinput:drag-route) begin -- debug/touchinput_gate.sh
         // deletes this block (and the s_ptr* writes) to prove D8 sees the
         // production wiring: the gate must go RED without it.
@@ -2965,9 +2977,8 @@ public final class TouchDispatcher {
                 return;  // consumed by an overlay; do NOT also hit the Activity
             }
         }
-        long t = android.os.SystemClock.uptimeMillis();
-        long down = s_gestureDownTime != 0L ? s_gestureDownTime : t;
-        MotionEvent ev = touchEvent(down, t, action, px, py, 0);
+        long down = s_gestureDownTime != 0L ? s_gestureDownTime : eventTime;
+        MotionEvent ev = touchEvent(down, eventTime, action, px, py, 0);
         try {
             if (deliverToTakenInputQueue(active, ev)) {
                 if (logThis) NativeLog.i(TAG, "  -> the window's input queue (px=" + px + " py=" + py + ")");
@@ -3019,6 +3030,7 @@ public final class TouchDispatcher {
      *  repeat only when AppKit says one happened. Callers with no AppKit event
      *  (the BACK chevron, the harness, a recording replay) use dispatchKey. */
     public void dispatchHostKey(int action, int keyCode, int unicodeChar, int metaState, boolean autoRepeat) {
+        hostPointerQueue.barrier();
         noteRealInput();
         if (routeToLoop(ActivityHost.peek())) {
             loopHandler().post(() -> deliverKey(action, keyCode, unicodeChar, metaState, autoRepeat));
