@@ -5645,7 +5645,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         }
         // Tier 3 M18: Material ripple, over the background + under the content.
         if (android.os.Looper.MACAPK_REAL_LOOPER) macapkDrawRipple(canvas);
-        onDraw(canvas);
+        int macapkContentSave = com.macapk.loader.UcSoftwareCanvas.beginContentDraw(this, canvas);
+        try {
+            onDraw(canvas);
+        } finally {
+            if (macapkContentSave >= 0) canvas.restoreToCount(macapkContentSave);
+        }
         // Diagnostic (MACAPK_TRACE_COMPOSE): for a Compose host view, log
         // its bounds + child count just before its (Compose-overridden)
         // dispatchDraw runs. Empty bounds or zero children means the

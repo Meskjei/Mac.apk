@@ -131,8 +131,6 @@ public class TextureView extends View {
         super(context, attrs, defStyleAttr, defStyleRes);
     }
 
-    // TextureView renders only with hardware acceleration in AOSP. We do not
-    // gate on that here.
     public boolean isOpaque() { return mOpaque; }
     public void setOpaque(boolean opaque) { mOpaque = opaque; }
 
@@ -332,6 +330,7 @@ public class TextureView extends View {
 
     @Override
     public void draw(android.graphics.Canvas canvas) {
+        if (canvas == null) return;
         // TextureView in AOSP does not draw via the app's Canvas machinery --
         // the render thread composites the SurfaceTexture's latest image. Our
         // render thread IS the Canvas pipeline, so this draw performs the
@@ -347,7 +346,10 @@ public class TextureView extends View {
             mDrawnGeneration = gen;
         }
         if (frame == null) frame = mCanvasContent;
-        if (frame != null && canvas != null) {
+        // UC paints its software WebView frame in its parent's onDraw. Consume
+        // and notify, but do not overlay the retained GPU frame a second time.
+        // Other producers (camera/video/lockCanvas) keep our software composite.
+        if (frame != null && !com.macapk.loader.UcSoftwareCanvas.ownsSoftwareFrame(this, canvas)) {
             mSrcRect.set(0, 0, frame.getWidth(), frame.getHeight());
             mDstRect.set(0, 0, getWidth(), getHeight());
             canvas.drawBitmap(frame, mSrcRect, mDstRect, null);

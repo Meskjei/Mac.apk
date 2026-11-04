@@ -65,6 +65,8 @@
 #include <libkern/OSCacheControl.h>  // sys_icache_invalidate
 #include <malloc/malloc.h>           // malloc_zone_pressure_relief (t3-syms RAM-measurement hook only)
 #include <sys/stat.h>                // mkdir (x18 plan-cache dir)
+#include <sys/socket.h>
+#include "uc_host_capabilities.h"
 #include <mach/mach.h>               // mach_task_self (guest_safe_read)
 #include <mach/mach_vm.h>            // mach_vm_read_overwrite (guest_safe_read)
 #include <mach-o/dyld.h>             // _dyld_image_count/_header/_name (VM census)
@@ -621,6 +623,7 @@ inline uint8_t  sym_bind(uint8_t st_info)   { return uint8_t(st_info >> 4); }
 
 class Image {
 public:
+    bool host_capability_rejected = false;
     bool load(const uint8_t* blob, size_t blob_size, const char* dbg_name);
     // t3-mmap (2026-07-24): "Lever 3" -- load directly from the on-disk
     // source .so, no embedded blob at all. `so_path_rel` is a path
@@ -4985,6 +4988,29 @@ void Image::run_init_array() {
         dbg_name_, init_array_count_);
 }
 
+static bool uc_host_supported(const std::vector<Elf64_Phdr>& headers,
+                              const uint8_t* blob, size_t size, int fd, const char* name) {
+    if (!name || !std::strstr(name, "libwebviewuc.so")) return true;
+    for (const auto& header : headers) {
+        if (header.p_type != 4 || header.p_filesz > 65536 || header.p_offset > size
+                || header.p_filesz > size - header.p_offset) continue;
+        std::vector<uint8_t> notes(header.p_filesz);
+        if (blob) std::memcpy(notes.data(), blob + header.p_offset, notes.size());
+        else if (!macapk_pread_full(fd, notes.data(), notes.size(), header.p_offset)) continue;
+        if (!macapk_uc_needs_seqpacket(name, notes.data(), notes.size())) continue;
+        int pair[2];
+        if (::socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == 0) {
+            ::close(pair[0]); ::close(pair[1]); return true;
+        }
+        std::fprintf(stderr, "[arm64-native] %s: unsupported UC core f66c0e11: Linux crash "
+            "transport requires AF_UNIX/SOCK_SEQPACKET (%s); rejecting library load "
+            "before guest initialization so the SDK may select its compatible fallback\n",
+            name, std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 bool Image::load(const uint8_t* blob, size_t blob_size, const char* dbg) {
     dbg_name_ = dbg ? dbg : "?";
     page_size_ = sysconf(_SC_PAGESIZE);
@@ -5009,6 +5035,10 @@ bool Image::load(const uint8_t* blob, size_t blob_size, const char* dbg) {
     phdrs_.resize(eh.e_phnum);
     std::memcpy(phdrs_.data(), blob + eh.e_phoff,
                 size_t(eh.e_phnum) * sizeof(Elf64_Phdr));
+    if (!uc_host_supported(phdrs_, blob, blob_size, -1, dbg_name_)) {
+        host_capability_rejected = true;
+        return false;
+    }
     // The section header table sits in no PT_LOAD, so read it now, while the
     // blob is still resident (it is reclaimed right after map_segments()).
     read_exec_sections(eh, blob, blob_size, -1);
@@ -5202,6 +5232,11 @@ bool Image::load_from_path(const char* so_path_rel, const char* dbg) {
         std::fprintf(stderr,
             "[arm64-native] %s: failed reading program-header table from "
             "%s: %s\n", dbg_name_, abspath.c_str(), std::strerror(errno));
+        ::close(fd);
+        return false;
+    }
+    if (!uc_host_supported(phdrs_, nullptr, file_size, fd, dbg_name_)) {
+        host_capability_rejected = true;
         ::close(fd);
         return false;
     }
@@ -15063,15 +15098,24 @@ unsigned long __macapk_arm64_native_auxv(unsigned long type) {
 
 // Load an arm64 Android ELF blob into memory. Returns an opaque handle
 // on success, nullptr on failure (with stderr diagnostic).
+// Cached Mach-O wrappers expose JNI_OnLoad even after their ELF load failed.
+// Give that export a real JNI_ERR target, rather than letting it branch to zero.
+static Image* rejected_uc_image() {
+    static Image image;
+    return &image;
+}
+static int rejected_uc_jni_onload(void*, void*) { return -1; }
+
 void* __macapk_arm64_native_load(const void* blob, size_t blob_size,
                                     const char* dbg_soname) {
     if (!macapk_arm64_load_prelude()) return nullptr;
     auto img = new Image;
     if (!img->load(static_cast<const uint8_t*>(blob), blob_size,
                    dbg_soname)) {
+        const bool unsupported = img->host_capability_rejected;
         unregister_image(img);
         delete img;
-        return nullptr;
+        return unsupported ? rejected_uc_image() : nullptr;
     }
     // Registered by load_common() itself, BEFORE the image's ifunc
     // resolvers and .init_array ran -- constructor-time faults must be
@@ -15096,9 +15140,10 @@ void* __macapk_arm64_native_load_from_path(const char* so_path,
     if (!macapk_arm64_load_prelude()) return nullptr;
     auto img = new Image;
     if (!img->load_from_path(so_path, dbg_soname)) {
+        const bool unsupported = img->host_capability_rejected;
         unregister_image(img);
         delete img;
-        return nullptr;
+        return unsupported ? rejected_uc_image() : nullptr;
     }
     // Registered by load_common() itself, BEFORE guest code first ran.
     return img;
@@ -15109,6 +15154,8 @@ extern "C" int macapk_pairip_inert_jni_onload(void* vm, void* reserved);
 
 void* __macapk_arm64_native_dlsym(void* handle, const char* name) {
     if (!handle || !name) return nullptr;
+    if (handle == rejected_uc_image())
+        return !std::strcmp(name, "JNI_OnLoad") ? reinterpret_cast<void*>(rejected_uc_jni_onload) : nullptr;
     Image* img = static_cast<Image*>(handle);
     // The wrapper's constructor fills one export slot per symbol by calling this,
     // and each export trampoline (`ldr x16,[slot]; br x16`) jumps to whatever the

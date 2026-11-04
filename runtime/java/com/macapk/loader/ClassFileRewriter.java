@@ -446,6 +446,28 @@ public final class ClassFileRewriter {
                     if (method.code != null) hits += rewriteBufferReadCopy(cf, method.code);
             }
 
+            // shortcut: UC 5.36.8 SDK selector contract; validate a new SDK before extending this fingerprint.
+            if (dotted.equals("com.uc.webview.internal.setup.z0")
+                    && "190cbef984498d68c753f265c77a09f3fead19053e3e52d93a6d70450c4794af".equals(java.util.HexFormat.of().formatHex(
+                        java.security.MessageDigest.getInstance("SHA-256").digest(raw)))) {
+                for (MethodEntry method : cf.methods) {
+                    if (method.code == null) continue;
+                    CodeAttr code = method.code;
+                    for (int at = code.codeOffset, end = at + code.codeLen; at < end;) {
+                        int op = raw[at] & 255, length = instructionLength(op, raw, at);
+                        if (length <= 0) break;
+                        if (op == OP_INVOKESTATIC && isMethodref(cf, u2(raw, at + 1),
+                                "com/uc/webview/base/GlobalSettings", "getBoolValue", "(I)Z")) {
+                            // Key 111 selects the cached update. Keep the SDK's initializing APK core instead.
+                            raw[at] = 87; raw[at + 1] = 3; raw[at + 2] = 0; // pop; iconst_0; nop
+                            hits++;
+                            System.err.println("[uc-host] selecting APK-bundled UC core; cached update not selected");
+                        }
+                        at += length;
+                    }
+                }
+            }
+
             if (hits > 0) {
                 byte[] out = cf.serialize();
                 if (DEBUG) {
@@ -607,6 +629,7 @@ public final class ClassFileRewriter {
     private static boolean needsFullParse(byte[] raw, String className) {
         try {
             String dotted = className == null ? "" : className.replace('/', '.');
+            if (dotted.equals("com.uc.webview.internal.setup.z0")) return true;
             if (dotted.equals("org.fdroid.download.glide.DownloadRequestLoader")
                 && "1".equals(System.getenv("MACAPK_GLIDE_HTTPFETCHER_SHIM"))) {
                 return true;
