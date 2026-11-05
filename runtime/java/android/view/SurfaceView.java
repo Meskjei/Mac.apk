@@ -1490,7 +1490,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
      *  and hiding keeps its contents) until the next present. */
     private volatile boolean macapkSurfaceLayerDrawn;
 
-    private int macapkSurfaceKey() {
+    public int macapkSurfaceKey() {
         int k = macapkSurfaceKey;
         if (k != 0) return k;
         synchronized (sSurfaceByKey) {
@@ -1619,7 +1619,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             return 0L;
         }
         try {
-            if (!v.macapkAttached || !v.isShown()) {
+            if (!v.macapkAttached || !v.isShown() || v.macapkOwnerStoppedUnderTop()) {
                 v.macapkNoteLayerPull(v.macapkAttached ? -3L : -2L, -1L);
                 return -1L;
             }
@@ -1737,7 +1737,7 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
         owner.macapkNativeWindowDrawFinished = true;
         try { owner.postInvalidate(); } catch (Throwable ignored) { }
         if (prev != null && prev != owner) {
-            // the previous owner stops punching: redraw it so its hole closes
+            // Refresh the prior view when legacy shared-layer placement changes.
             try { prev.postInvalidate(); } catch (Throwable ignored) { }
         }
         if (prev != owner) {
@@ -1747,11 +1747,6 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
                 + (owner.mZOrderOnTop ? "ABOVE" : "BELOW (hole punched)")
                 + " the window (MACAPK_SV_GUEST_BELOW)");
         }
-    }
-
-    private boolean macapkIsNativeWindowOwner() {
-        java.lang.ref.WeakReference<SurfaceView> ref = sNativeWindowOwner;
-        return ref != null && ref.get() == this;
     }
 
     /** Native pull, every drawInMTKView tick: where the native-EGL window layer
@@ -3791,12 +3786,9 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
             // paints under this view would hide the surface. Only reachable once
             // the runtime has a per-surface layer (macapkPresentThroughSurfaceLayer).
             canvas.punchHole(0f, 0f, getWidth(), getHeight(), 0f, 0f, getAlpha());
-        } else if (macapkNativeWindowDrawFinished && !mZOrderOnTop && macapkIsNativeWindowOwner()) {
-            // The native-EGL window layer sits BELOW the window for this view
-            // (macapkNativeWindowLayerZ == 1): the same AOSP hole, on the same
-            // condition (draw() :512-521). Without it the window's own opaque
-            // background -- drawn before this view -- covers the producer's
-            // frames (the Fruit Ninja black-out of the first z-below attempt).
+        } else if (macapkNativeWindowDrawFinished && !mZOrderOnTop) {
+            // Each native producer below its window needs its own AOSP hole;
+            // the window's opaque background would otherwise cover its frames.
             canvas.punchHole(0f, 0f, getWidth(), getHeight(), 0f, 0f, getAlpha());
             if (!macapkNativeHoleLogged) {
                 macapkNativeHoleLogged = true;

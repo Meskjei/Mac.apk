@@ -36149,10 +36149,22 @@ static inline bool macapk_is_unity_window(void* w) {
         && g_macapk_unity_window.magic == kMacApkNWMagic;
 }
 
-// TextureView surfaces own separate streams; they must not alias the full-window layer.
-struct MacApkStreamWindow { jobject surface; unsigned references; int width, height; };
+// Each Surface owns its native window; TextureView streams and SurfaceView layers stay distinct.
+struct MacApkStreamWindow {
+    MacApkNativeWindow native{};
+    jobject surface;
+    unsigned references;
+    int width, height, key = 0;
+};
 static std::mutex g_stream_windows_mu;
 static std::unordered_map<void*, std::unique_ptr<MacApkStreamWindow>> g_stream_windows;
+static MacApkNativeWindow* macapk_native_window(void* window) {
+    if (macapk_is_unity_window(window)) return &g_macapk_unity_window;
+    std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+    auto it = g_stream_windows.find(window);
+    return it != g_stream_windows.end() && it->second->native.magic == kMacApkNWMagic
+        ? &it->second->native : nullptr;
+}
 static bool macapk_stream_window_create(void* dpy, void* config, void* window,
                                         const int32_t* attribs, void** result);
 extern "C" unsigned __macapk_arm64_eglDestroySurface(void* dpy, void* surface);
@@ -64409,6 +64421,7 @@ static jobject macapk_stream_surface(JNIEnv* env, void* window) {
 }
 static bool macapk_stream_window_create(void* dpy, void* config, void* window,
                                         const int32_t* attribs, void** result) {
+    if (macapk_native_window(window)) return false;
     AttachGuard guard;
     if (!guard.env) return false;
     jobject surface = macapk_stream_surface(guard.env, window);
@@ -64487,8 +64500,19 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
     // window's DEFAULT size (NATIVE_WINDOW_WIDTH reaches BufferQueueProducer::
     // query -> mCore->mDefaultWidth), which Unreal divides touch X/Y by.
     if (width < 0 || height < 0 || (width == 0) != (height == 0)) return -EINVAL;
-    if (!macapk_is_unity_window(w)) return 0;
-    if (format != 0) g_macapk_unity_window.format = format;
+    MacApkNativeWindow* native = macapk_native_window(w);
+    if (!native) return 0;
+    if (format != 0) native->format = format;
+    {
+        std::lock_guard<std::mutex> lock(g_stream_windows_mu);
+        auto it = g_stream_windows.find(w);
+        if (it != g_stream_windows.end() && it->second->key) {
+            using Set = void (*)(int, int, int);
+            static auto set = reinterpret_cast<Set>(dlsym(RTLD_DEFAULT, "CocoaSetSurfaceBufferGeometry"));
+            if (set) set(it->second->key, width, height);
+            return set ? 0 : -ENOSYS;
+        }
+    }
     using GeoFn = void (*)(int, int);
     static GeoFn set_geo = reinterpret_cast<GeoFn>(
         dlsym(RTLD_DEFAULT, "CocoaSetNativeEglBufferGeometry"));
@@ -64567,16 +64591,33 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
     jmethodID get = cls ? guard.env->GetMethodID(cls, "macapkGetSurfaceTexture",
                                                "()Landroid/graphics/SurfaceTexture;") : nullptr;
     jobject texture = get ? guard.env->CallObjectMethod(reinterpret_cast<jobject>(surface), get) : nullptr;
+    jmethodID getKey = cls ? guard.env->GetMethodID(cls, "macapkNativeWindowKey", "()I") : nullptr;
+    if (!getKey && guard.env->ExceptionCheck()) guard.env->ExceptionClear();
+    int key = getKey ? guard.env->CallIntMethod(reinterpret_cast<jobject>(surface), getKey) : 0;
     if (cls) guard.env->DeleteLocalRef(cls);
     if (guard.env->ExceptionCheck()) return nullptr;
-    if (texture) {
-        jclass tc = guard.env->GetObjectClass(texture);
-        jmethodID width = guard.env->GetMethodID(tc, "macapkGetDefaultWidth", "()I");
-        jmethodID height = guard.env->GetMethodID(tc, "macapkGetDefaultHeight", "()I");
-        int w = width ? guard.env->CallIntMethod(texture, width) : 0;
-        int h = height ? guard.env->CallIntMethod(texture, height) : 0;
-        guard.env->DeleteLocalRef(tc); guard.env->DeleteLocalRef(texture);
-        if (guard.env->ExceptionCheck()) return nullptr;
+    if (texture || key > 0) {
+        int w = 0, h = 0;
+        void* layer = nullptr;
+        if (texture) {
+            jclass tc = guard.env->GetObjectClass(texture);
+            jmethodID width = guard.env->GetMethodID(tc, "macapkGetDefaultWidth", "()I");
+            jmethodID height = guard.env->GetMethodID(tc, "macapkGetDefaultHeight", "()I");
+            w = width ? guard.env->CallIntMethod(texture, width) : 0;
+            h = height ? guard.env->CallIntMethod(texture, height) : 0;
+            guard.env->DeleteLocalRef(tc); guard.env->DeleteLocalRef(texture);
+            if (guard.env->ExceptionCheck()) return nullptr;
+        } else {
+            jclass sc = guard.env->GetObjectClass(reinterpret_cast<jobject>(surface));
+            jmethodID note = guard.env->GetMethodID(sc, "macapkNoteNativeWindowConsumer", "()V");
+            if (note) guard.env->CallVoidMethod(reinterpret_cast<jobject>(surface), note);
+            guard.env->DeleteLocalRef(sc);
+            if (guard.env->ExceptionCheck()) return nullptr;
+            using GetLayer = void* (*)(int, int*, int*);
+            static auto getLayer = reinterpret_cast<GetLayer>(dlsym(RTLD_DEFAULT, "CocoaNativeEglLayerForSurface"));
+            layer = getLayer ? getLayer(key, &w, &h) : nullptr;
+            if (!layer || w <= 0 || h <= 0) return nullptr;
+        }
         std::lock_guard<std::mutex> lock(g_stream_windows_mu);
         for (auto& entry : g_stream_windows) {
             if (guard.env->IsSameObject(entry.second->surface, reinterpret_cast<jobject>(surface))) {
@@ -64585,7 +64626,10 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
         }
         jobject ref = guard.env->NewGlobalRef(reinterpret_cast<jobject>(surface));
         if (!ref) return nullptr;
-        auto record = std::make_unique<MacApkStreamWindow>(MacApkStreamWindow{ref, 1, w, h});
+        auto record = std::make_unique<MacApkStreamWindow>();
+        record->surface = ref; record->references = 1;
+        record->width = w; record->height = h; record->key = key;
+        if (layer) record->native = MacApkNativeWindow{kMacApkNWMagic, w, h, 1, layer, {}};
         void* handle = record.get(); g_stream_windows.emplace(handle, std::move(record));
         return handle;
     }
@@ -64636,10 +64680,11 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
 // The CAMetalLayer behind an ANativeWindow ANativeWindow_fromSurface returned
 // (NULL for the dummy): what vkCreateAndroidSurfaceKHR presents to.
 extern "C" void* __macapk_native_window_layer(void* w) {
-    return macapk_is_unity_window(w) ? g_macapk_unity_window.layer : nullptr;
+    auto* native = macapk_native_window(w);
+    return native ? native->layer : nullptr;
 }
 extern "C" int32_t __macapk_arm64_ANativeWindow_getFormat(void* w) {
-    if (macapk_is_unity_window(w)) return g_macapk_unity_window.format;
+    if (auto* native = macapk_native_window(w)) return native->format;
     return 1; // WINDOW_FORMAT_RGBA_8888
 }
 // ANativeWindow_toSurface(env, window) -- NDK native_window_jni.h (API 26+):

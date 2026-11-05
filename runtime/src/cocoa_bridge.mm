@@ -8342,6 +8342,7 @@ void CocoaPresentBitmapFrom(int width, int height, MacapkPixelsAcquireFn acquire
 // (hidden). MRC: g_surface_layers retains its layers.
 // Bisect: MACAPK_SV_SURFACE_LAYER=0 on the Java side never reaches this.
 static NSMutableDictionary* g_surface_layers = nil;   // NSNumber(key) -> CALayer; main thread only
+static std::map<int, CGSize> g_surface_buffer_sizes;   // native producers' requested buffer sizes
 
 // SurfaceView's two pull methods, resolved once (the class is on the
 // runtime's own classpath, as for MacapkQueryVideoSinkRectPacked).
@@ -8404,6 +8405,7 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* 
     if (packed == 0) {
         [layer removeFromSuperlayer];
         [g_surface_layers removeObjectForKey:nk];
+        g_surface_buffer_sizes.erase(key);
         return false;
     }
     int16_t xs  = (int16_t) ((packed >> 48) & 0xffff);
@@ -8429,8 +8431,70 @@ static bool MacapkApplySurfaceLayerGeometry(JNIEnv* env, NSNumber* nk, CALayer* 
     if (layer.zPosition != z) layer.zPosition = z;
     if (layer.contentsScale != host.layer.contentsScale)
         layer.contentsScale = host.layer.contentsScale;
+    if ([layer isKindOfClass:[CAMetalLayer class]]) {
+        auto size = g_surface_buffer_sizes.find(key);
+        CGSize drawable = size == g_surface_buffer_sizes.end() ? CGSizeMake(wpx, hpx) : size->second;
+        if (!CGSizeEqualToSize(((CAMetalLayer*)layer).drawableSize, drawable))
+            ((CAMetalLayer*)layer).drawableSize = drawable;
+    }
     if (layer.hidden) layer.hidden = NO;
     return true;
+}
+
+// SurfaceView windows share the host view, but each EGL producer needs its own layer.
+extern "C" void* CocoaNativeEglLayerForSurface(int key, int* outW, int* outH) {
+    struct Handoff {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool done = false;
+        void* layer = nullptr;
+        int width = 0, height = 0;
+    };
+    auto result = std::make_shared<Handoff>();
+    void (^create)(void) = ^{
+        CAMetalLayer* layer = nil;
+        if (key > 0 && MacapkCanvasOverlayForPresent()) {
+            if (!g_surface_layers) g_surface_layers = [[NSMutableDictionary alloc] init];
+            NSNumber* nk = [NSNumber numberWithInt:key];
+            layer = (CAMetalLayer*)g_surface_layers[nk];
+            if (layer && ![layer isKindOfClass:[CAMetalLayer class]]) {
+                [layer removeFromSuperlayer];
+                layer = nil;
+            }
+            if (!layer) {
+                layer = [CAMetalLayer layer];
+                macapk_configure_native_egl_layer(layer, g_overlay_attached_view,
+                    g_overlay_attached_view.window.backingScaleFactor);
+                g_surface_layers[nk] = layer;
+            }
+            macapk_install_drawable_swizzle();
+            MacapkApplySurfaceLayerGeometry(MacapkMainThreadEnv(), nk, layer);
+        }
+        {
+            std::lock_guard<std::mutex> lock(result->mu);
+            result->layer = (__bridge void*)layer;
+            result->width = (int)layer.drawableSize.width;
+            result->height = (int)layer.drawableSize.height;
+            result->done = true;
+        }
+        result->cv.notify_all();
+    };
+    if ([NSThread isMainThread]) create();
+    else dispatch_async(dispatch_get_main_queue(), create);
+    std::unique_lock<std::mutex> lock(result->mu);
+    result->cv.wait_for(lock, std::chrono::seconds(2), [&] { return result->done; });
+    if (outW) *outW = result->width;
+    if (outH) *outH = result->height;
+    return result->layer;
+}
+
+extern "C" void CocoaSetSurfaceBufferGeometry(int key, int width, int height) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (width > 0 && height > 0) g_surface_buffer_sizes[key] = CGSizeMake(width, height);
+        else g_surface_buffer_sizes.erase(key);
+        CALayer* layer = g_surface_layers[[NSNumber numberWithInt:key]];
+        if (layer) MacapkApplySurfaceLayerGeometry(MacapkMainThreadEnv(), @(key), layer);
+    });
 }
 
 /** Per drawInMTKView tick: put the native-EGL window layer (g_unity_layer) on

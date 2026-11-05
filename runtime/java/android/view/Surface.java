@@ -121,6 +121,10 @@ public class Surface implements android.os.Parcelable {
         return mOwnerSurfaceView;
     }
 
+    public int macapkNativeWindowKey() {
+        return mOwnerSurfaceView == null ? 0 : mOwnerSurfaceView.macapkSurfaceKey();
+    }
+
     /** Mac.apk framework-internal, called by the Bionic shim's
      *  ANativeWindow_fromSurface (bionic_shim.cpp) on the Surface a native
      *  producer is taking: on a device that is android_view_Surface_getNativeWindow
