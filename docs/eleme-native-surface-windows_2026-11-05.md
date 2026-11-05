@@ -34,4 +34,13 @@ The first platform round completed traditional-page collection, but AI collectio
 
 That second round captured the real AI query and reply (text ¥12, card ¥8.5), then exposed the missing ActivityGroup type in the popup. It was paused and is not accepted as a complete comparison. Final validation uses the completed fixes: [android_local_price_input_fix_final_20261105](https://bot.alibaba-inc.com/investigations/android_local_price_input_fix_final_20261105).
 
+Final platform execution completed (`round_complete`, 1 complete pair, 0 pending):
+
+- Traditional: `run_qza80wa68n`, pass, 4 actions; confirmed product detail at promotional ¥12.
+- AI: `run_e4xdetyeq8`, pass, 16 actions; the trace contains the new query, reply, store popup and same-product detail. The detail explicitly shows estimated ¥8.5 alongside discounted ¥12.
+- Comparison remains uncertain (0 valid pairs, 1 uncertain): account/offer context was not established, the AI evidence review timed out, and the estimate is not a demonstrated checkout price. The raw AI reading labels ¥8.5 as promotion; the visible estimate label takes precedence when interpreting it. No claim of a verified payable price difference is made.
+- The final runtime log passes `native_surface_windows_check.py`: 3 distinct native window creations, successful presents, covered-page hide/restore, and no activity `onCreate` failure. Both the original EGL failure log and the earlier popup-failure log fail their respective regression assertions.
+
+The verified source is `4366338` on `codex/android-price-input-fix-20261105` (following `e2d615a`). Runtime build identities: FRAMEWORK_ID `7ceb6681767433da`, JAVA_ID `c3b4db367943217c`, JARS_ID `ab835c6cdc7a6f1b`, NATIVE_ID `b44f68c8245cbb72`. This is local source-runtime acceptance, not a production service deployment or a published CLI/SDK upgrade.
+
 The distributable candidate installer was terminated before installation (SIGKILL); the cause is unresolved. It is not published or release-accepted. Other Android apps, games, physical phones and iOS are outside this validation. GitNexus does not index the two large native source files; their JNI/dlsym callers and lifecycle paths were reviewed directly.

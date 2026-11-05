@@ -14,6 +14,7 @@ assert len({window for window, _, _ in windows}) >= 2, "distinct pages shared an
 assert len({layer for _, layer, _ in windows}) >= 2, "distinct pages shared a CAMetalLayer"
 assert "Failed to swap buffers" not in log, "a native page could not present its frame"
 assert "Could not create an EGL window surface" not in log, "a native page lost its EGL producer"
+assert "onCreate threw" not in log, "an activity failed to create its content"
 states = re.findall(r"per-surface layer pull \(key (\d+)\): (shown|hidden)", log)
 assert any(
     state == "hidden" and (key, "shown") in states[:index] and (key, "shown") in states[index + 1:]
