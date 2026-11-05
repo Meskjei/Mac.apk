@@ -28,6 +28,8 @@
 // It exits when its stdin closes, i.e. when the runtime that started it dies.
 
 import CoreLocation
+import CoreWLAN
+import AppKit
 import Foundation
 
 final class Helper: NSObject, CLLocationManagerDelegate {
@@ -55,6 +57,31 @@ final class Helper: NSObject, CLLocationManagerDelegate {
     func sendAuth() {
         let reduced = manager.accuracyAuthorization == .reducedAccuracy ? 1 : 0
         send("auth \(manager.authorizationStatus.rawValue) \(reduced)")
+    }
+
+    func wifiSnapshot() -> [String: Any] {
+        guard CLLocationManager.locationServicesEnabled(),
+              manager.authorizationStatus == .authorizedAlways,
+              let wifi = CWWiFiClient.shared().interface() else { return [:] }
+        guard wifi.powerOn() else { return ["powered": false] }
+        func frequency(_ channel: CWChannel?) -> Int {
+            guard let channel else { return 0 }
+            switch channel.channelBand {
+            case .band2GHz: return channel.channelNumber == 14 ? 2484 : 2407 + 5 * channel.channelNumber
+            case .band5GHz: return 5000 + 5 * channel.channelNumber
+            default: return 0
+            }
+        }
+        let networks: [[String: Any]] = (wifi.cachedScanResults() ?? []).compactMap { network in
+            guard let bssid = network.bssid, !bssid.isEmpty else { return nil }
+            return ["ssid": network.ssid ?? "", "bssid": bssid,
+                    "rssi": network.rssiValue, "frequency": frequency(network.wlanChannel)]
+        }
+        // CoreWLAN's cache has no RF timestamp; do not invent a fresh scan time.
+        return ["powered": wifi.powerOn(), "ssid": wifi.ssid() ?? "",
+                "bssid": wifi.bssid() ?? "", "rssi": wifi.rssiValue(),
+                "linkSpeed": wifi.transmitRate(), "frequency": frequency(wifi.wlanChannel()),
+                "networks": Array(networks.prefix(128))]
     }
 
     func handle(_ line: String) {
@@ -95,6 +122,10 @@ final class Helper: NSObject, CLLocationManagerDelegate {
             } else {
                 send("cached none")
             }
+        case "wifi":
+            guard parts.count == 2, let request = UInt64(parts[1]),
+                  let data = try? JSONSerialization.data(withJSONObject: wifiSnapshot()) else { return }
+            send("wifi \(request) " + String(decoding: data, as: UTF8.self))
         default:
             break
         }
@@ -117,6 +148,10 @@ final class Helper: NSObject, CLLocationManagerDelegate {
 enum LocationHelperMain {
     static func main() {
         signal(SIGPIPE, SIG_IGN)   // a runtime that died mid-write must not kill us noisily
+        // CoreWLAN resolves the running App identity; a Foundation-only process has none.
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        application.finishLaunching()
         let helper = Helper()
         var pending = Data()
         FileHandle.standardInput.readabilityHandler = { h in

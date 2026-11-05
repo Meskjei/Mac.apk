@@ -128,10 +128,10 @@ public class NetworkCapabilities {
      *  (the documented no-data value) rather than a fabricated number. */
     public int getSignalStrength() { return SIGNAL_STRENGTH_UNSPECIFIED; }
 
-    /** AOSP getTransportInfo(): transport-specific info object (e.g. WifiInfo)
-     *  or null. We model an opaque WIFI transport with no extra info -> null,
-     *  the legal "no transport info" return. */
-    public TransportInfo getTransportInfo() { return null; }
+    /** Use the same permission-redacted Wi-Fi snapshot as the legacy API. */
+    public TransportInfo getTransportInfo() {
+        return hasTransport(TRANSPORT_WIFI) ? new android.net.wifi.WifiManager().getConnectionInfo() : null;
+    }
 
     /** AOSP getNetworkSpecifier(): the specifier the request/network was
      *  matched on, or null for the default network (which carries none). */

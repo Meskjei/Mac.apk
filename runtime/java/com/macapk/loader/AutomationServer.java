@@ -144,35 +144,38 @@ public final class AutomationServer {
             return null;
         });
     }
+    private String captureGeometry() throws Exception {
+        Activity a = ActivityHost.peek();
+        if (a == null || (a.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_SECURE) != 0)
+            throw new IllegalStateException("capture_secure_or_unavailable_window");
+        for (WindowOverlayStack.Layer layer : WindowOverlayStack.snapshot())
+            if (layer.params != null && (layer.params.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0)
+                throw new IllegalStateException("capture_secure_window");
+        return geometry();
+    }
     private JSONObject screenshot() throws Exception {
-        String before = ui(() -> {
-            Activity a = ActivityHost.peek();
-            if (a == null || (a.getWindow().getAttributes().flags & WindowManager.LayoutParams.FLAG_SECURE) != 0)
-                throw new IllegalStateException("capture_secure_or_unavailable_window");
-            for (WindowOverlayStack.Layer layer : WindowOverlayStack.snapshot())
-                if (layer.params != null && (layer.params.flags & WindowManager.LayoutParams.FLAG_SECURE) != 0)
-                    throw new IllegalStateException("capture_secure_window");
-            return geometry();
-        });
+        String before = ui(this::captureGeometry);
         Path done = captures.resolve("macapk_capture_" + pid + ".done"), output = captures.resolve("macapk_capture_" + pid + "_composite.png");
         Files.deleteIfExists(done); Files.deleteIfExists(output);
         Path request = captures.resolve("macapk_capture_req_" + pid);
         Files.writeString(request, "composite-current-v1", StandardOpenOption.CREATE_NEW);
-        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
-        while (!Files.exists(done, LinkOption.NOFOLLOW_LINKS) && System.nanoTime() < until) Thread.sleep(25);
-        if (!Files.exists(done, LinkOption.NOFOLLOW_LINKS) || !Files.isRegularFile(output, LinkOption.NOFOLLOW_LINKS)
-                || !Files.readString(done).contains("composite")) throw new IllegalStateException("capture_incomplete");
-        byte[] png = Files.readAllBytes(output);
-        if (png.length > 12 * 1024 * 1024) throw new IllegalStateException("capture_too_large");
-        var image = ImageIO.read(new java.io.ByteArrayInputStream(png));
-        return ui(() -> {
-            long[] size = TouchDispatcher.automationGeometry();
-            if (!before.equals(geometry()) || image == null || image.getWidth() != size[0] || image.getHeight() != size[1])
-                throw new IllegalStateException("capture_window_changed");
-            frameId = UUID.randomUUID().toString(); frameGeometry = before;
-            return new JSONObject().put("png", Base64.getEncoder().encodeToString(png)).put("width", size[0]).put("height", size[1])
-                .put("pointWidth", size[0]).put("pointHeight", size[1]).put("scale", 1).put("frameId", frameId);
-        });
+        try {
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(8);
+            while (!Files.exists(done, LinkOption.NOFOLLOW_LINKS) && System.nanoTime() < until) Thread.sleep(25);
+            if (!Files.exists(done, LinkOption.NOFOLLOW_LINKS) || !Files.isRegularFile(output, LinkOption.NOFOLLOW_LINKS)
+                    || !Files.readString(done).contains("composite")) throw new IllegalStateException("capture_incomplete");
+            byte[] png = Files.readAllBytes(output);
+            if (png.length > 12 * 1024 * 1024) throw new IllegalStateException("capture_too_large");
+            var image = ImageIO.read(new java.io.ByteArrayInputStream(png));
+            return ui(() -> {
+                long[] size = TouchDispatcher.automationGeometry();
+                if (!before.equals(captureGeometry()) || image == null || image.getWidth() != size[0] || image.getHeight() != size[1])
+                    throw new IllegalStateException("capture_window_changed");
+                frameId = UUID.randomUUID().toString(); frameGeometry = before;
+                return new JSONObject().put("png", Base64.getEncoder().encodeToString(png)).put("width", size[0]).put("height", size[1])
+                    .put("pointWidth", size[0]).put("pointHeight", size[1]).put("scale", 1).put("frameId", frameId);
+            });
+        } finally { Files.deleteIfExists(request); }
     }
     private JSONObject tree() throws Exception {
         return ui(() -> {

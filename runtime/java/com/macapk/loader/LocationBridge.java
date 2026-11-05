@@ -43,6 +43,7 @@ public final class LocationBridge {
     private static native boolean nativeReducedAccuracy();
     private static native boolean nativeServicesEnabled();
     private static native double[] nativeCachedFix();
+    private static native String nativeWifiSnapshot();
     private static native void nativeRequestAuth();
     private static native void nativeStart(boolean reduced);
     private static native void nativeStop();
@@ -144,6 +145,37 @@ public final class LocationBridge {
 
     /** macOS has authorized this app (any accuracy). */
     public static boolean authorized() { return authStatus() == AUTH_AUTHORIZED; }
+
+    /** Wi-Fi identities are location data; both Android and macOS must allow them. */
+    public static org.json.JSONObject wifiSnapshot() {
+        android.app.Application app = android.app.ActivityThread.currentApplication();
+        if (app == null) return new org.json.JSONObject();
+        try {
+            boolean wifi = app.checkSelfPermission(android.Manifest.permission.ACCESS_WIFI_STATE)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            boolean fine = app.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            boolean host = wifi && fine && available() && authorized() && servicesEnabled();
+            if (wifi && fine && host) {
+                String json = nativeWifiSnapshot();
+                if (json != null) {
+                    org.json.JSONObject snapshot = new org.json.JSONObject(json);
+                    org.json.JSONArray networks = snapshot.optJSONArray("networks");
+                    wifiState("cache=" + (networks == null ? 0 : networks.length())
+                            + " connected=" + !snapshot.optString("bssid", "").isEmpty());
+                    return snapshot;
+                }
+                wifiState("helper unavailable");
+            } else {
+                wifiState("withheld wifi=" + wifi + " fine=" + fine + " host=" + host);
+            }
+        } catch (Exception | UnsatisfiedLinkError ignored) { }
+        return new org.json.JSONObject();
+    }
+    private static volatile String sWifiState;
+    private static void wifiState(String state) {
+        if (!state.equals(sWifiState)) { sWifiState = state; NativeLog.i(TAG, "host Wi-Fi " + state); }
+    }
 
     /** macOS has refused this app, or the system-wide switch is off (Apple
      *  folds both into kCLAuthorizationStatusDenied). */

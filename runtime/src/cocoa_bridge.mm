@@ -49,6 +49,7 @@
 #include "macapk/self_capture.h"
 #include "macapk/pending_layer_captures.h"
 #include "macapk/opaque_pixels.h"
+#include "macapk/webview_capture.h"
 #include "macapk/app_process_group.h"   // AOSP killProcessGroup on app death (macapk_terminate_now)
 #include <libproc.h>        // proc_pidpath -- the app-owned fork test in macapk_terminate_now
 #include <signal.h>         // SIGKILL
@@ -3280,6 +3281,8 @@ static MTKView* MacapkCaptureView() {
     return nil;
 }
 
+static MacapkWebViewCapture g_webview_capture;
+
 static bool MacapkBuildCompositeCapture() {
     @autoreleasepool {
         MTKView* view = MacapkCaptureView();
@@ -3327,8 +3330,8 @@ static bool MacapkBuildCompositeCapture() {
             CGContextClipToRect(ctx, rectPx);
             CGContextSetAlpha(ctx, l.opacity);
             CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
-            bool drew = false;
-            if ([l isKindOfClass:[CAMetalLayer class]]) {
+            bool drew = g_webview_capture.draw(ctx, l, rectPx);
+            if (!drew && [l isKindOfClass:[CAMetalLayer class]]) {
                 std::vector<uint8_t> px; int lw = 0, lh = 0;
                 {
                     std::lock_guard<std::mutex> lk(g_lpix_mu);
@@ -3357,7 +3360,7 @@ static bool MacapkBuildCompositeCapture() {
                         CGDataProviderRelease(p);
                     }
                 }
-            } else {
+            } else if (!drew) {
                 id c = l.contents;
                 if (c && CFGetTypeID((__bridge CFTypeRef)c) == CGImageGetTypeID()) {
                     CGContextDrawImage(ctx, rectPx, (CGImageRef)c);
@@ -3439,16 +3442,33 @@ static bool MacapkLayerCoversViewport(CALayer* l, CGRect viewport) {
 static bool MacapkCaptureCurrentComposite() {
     if (!MacapkSelfCaptureEnabled() || g_cap_window_live.load(std::memory_order_acquire)) return false;
     char req[PATH_MAX]; MacapkCaptureReqPath(req, sizeof(req));
-    if (!MacapkCurrentCompositeRequested(req)) return false;
+    if (!MacapkCurrentCompositeRequested(req)) { g_webview_capture.clear(); return false; }
     static uint64_t started = 0;
     const uint64_t now = (uint64_t)(CACurrentMediaTime() * 1000.0);
     struct stat st;
     // The request's inode distinguishes retries after an incomplete capture.
     static ino_t requestInode = 0;
+    static timespec requestModified = {};
     if (::stat(req, &st) != 0) return false;
-    if (requestInode != st.st_ino) { requestInode = st.st_ino; started = now; }
+    if (requestInode != st.st_ino || requestModified.tv_sec != st.st_mtimespec.tv_sec || requestModified.tv_nsec != st.st_mtimespec.tv_nsec) {
+        requestInode = st.st_ino; requestModified = st.st_mtimespec; started = now;
+    }
     MTKView* view = MacapkCaptureView();
     bool ready = view && view.layer;
+    if (ready) {
+        const auto web = g_webview_capture.prepare(view, (uint64_t)st.st_mtimespec.tv_sec * 1000000000u + st.st_mtimespec.tv_nsec);
+        if (web == MacapkWebViewCapture::State::pending) return true;
+        if (web == MacapkWebViewCapture::State::failed) {
+            char done[PATH_MAX], tmp[PATH_MAX]; MacapkCaptureDonePath(done, sizeof(done));
+            std::snprintf(tmp, sizeof(tmp), "%s.part", done);
+            if (FILE* f = std::fopen(tmp, "w")) {
+                std::fputs("incomplete-webview\n", f); std::fclose(f);
+                ::unlink(req); ::rename(tmp, done);
+            }
+            g_webview_capture.clear(); requestInode = 0;
+            return true;
+        }
+    }
     std::vector<MacapkLatestDrawable> layers;
     if (ready) {
         std::vector<CALayer*> visible;
@@ -3480,11 +3500,12 @@ static bool MacapkCaptureCurrentComposite() {
         if (FILE* f = std::fopen(tmp, "w")) {
             std::fputs("composite\n", f); std::fclose(f);
             ::unlink(req); ::rename(tmp, done);
+            g_webview_capture.clear();
             requestInode = 0;
             return true;
         }
     }
-    if (now - started >= 150) {
+    if (now - started >= 150 && !g_webview_capture.hasWebViews()) {
         // Unknown/in-flight layers retain the complete legacy collection window.
         if (FILE* f = std::fopen(req, "w")) std::fclose(f);
         requestInode = 0;

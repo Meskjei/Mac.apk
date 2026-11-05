@@ -1,6 +1,5 @@
 // android.net.wifi.WifiManager -- Wi-Fi service. Apps reach for it
-// to read the connection MAC for analytics. We claim "always on" and
-// return the same WifiInfo every time.
+// to read connection details or feed a network-location SDK. Radio control is unsupported.
 package android.net.wifi;
 
 import android.net.DhcpInfo;
@@ -40,7 +39,6 @@ public class WifiManager {
     public static final int WIFI_MODE_FULL_HIGH_PERF = 3;
     public static final int WIFI_MODE_FULL_LOW_LATENCY = 4;
 
-    private final WifiInfo info = new WifiInfo();
     private final DhcpInfo dhcp = new DhcpInfo();
 
     public WifiManager() {}
@@ -49,12 +47,28 @@ public class WifiManager {
     public int     getWifiState()            { return WIFI_STATE_ENABLED; }
     public boolean setWifiEnabled(boolean on) { return false; }
 
-    public WifiInfo getConnectionInfo()       { return info; }
+    public WifiInfo getConnectionInfo()       { return new WifiInfo(com.macapk.loader.LocationBridge.wifiSnapshot()); }
     // AOSP: getDhcpInfo returns the current DHCP-supplied connection
     // info as a DhcpInfo (all fields are zero on macOS since we don't
     // expose underlying DHCP state).
     public DhcpInfo getDhcpInfo()             { return dhcp; }
-    public List<?>  getScanResults()          { return Collections.emptyList(); }
+    public List<ScanResult> getScanResults()  { return scanResults(com.macapk.loader.LocationBridge.wifiSnapshot()); }
+    static List<ScanResult> scanResults(org.json.JSONObject snapshot) {
+        var result = new java.util.ArrayList<ScanResult>();
+        org.json.JSONArray networks = snapshot.optJSONArray("networks");
+        if (networks == null) return result;
+        for (int i = 0; i < Math.min(networks.length(), 128); i++) {
+            org.json.JSONObject network = networks.optJSONObject(i);
+            if (network == null || network.optString("bssid", "").isEmpty()) continue;
+            ScanResult scan = new ScanResult();
+            scan.BSSID = network.optString("bssid", ""); scan.SSID = network.optString("ssid", "");
+            scan.level = network.optInt("rssi", WifiInfo.INVALID_RSSI);
+            scan.frequency = network.optInt("frequency", 0); scan.capabilities = ""; scan.channelWidth = ScanResult.UNSPECIFIED;
+            result.add(scan);
+        }
+        return result;
+    }
+    // shortcut: active scans/broadcasts remain unsupported; add CoreWLAN scanning when fresh RF samples are needed.
     public boolean  startScan()               { return false; }
     public boolean  reconnect()               { return false; }
     public boolean  reassociate()             { return false; }

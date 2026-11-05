@@ -197,6 +197,8 @@ swiftc \
     -parse-as-library \
     -target "$SWIFT_TARGET" \
     -framework CoreLocation \
+    -framework CoreWLAN \
+    -framework AppKit \
     -o "$LOC_APP/Contents/MacOS/macapk-location" \
     "$LAUNCHER_DIR/LocationHelperMain.swift"
 cat > "$LOC_APP/Contents/Info.plist" <<'LOCPLIST'

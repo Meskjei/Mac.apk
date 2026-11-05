@@ -165,6 +165,10 @@ int                     g_hin = -1;     // we write commands here
 int                     g_hfails = 0;   // spawns that died before saying anything
 bool                    g_cached_ready = false;
 std::vector<double>     g_cached;       // empty = "cached none"
+std::mutex              g_wifi_mu;
+uint64_t                g_wifi_request = 0;
+bool                    g_wifi_ready = false;
+std::string             g_wifi;
 
 constexpr int kMaxHelperFails = 3;
 
@@ -196,7 +200,8 @@ void DeliverFields(const double v[12]) {
 }
 
 void HelperLine(const std::string& line, bool& spoke) {
-    if (TraceOn()) std::fprintf(stderr, "[location] helper: %s\n", line.c_str());
+    if (TraceOn() && line.compare(0, 5, "wifi ") != 0)
+        std::fprintf(stderr, "[location] helper: %s\n", line.c_str());
     if (line.compare(0, 5, "auth ") == 0) {
         int st = -1, red = 0;
         if (std::sscanf(line.c_str() + 5, "%d %d", &st, &red) >= 1 && st >= 0) {
@@ -217,6 +222,15 @@ void HelperLine(const std::string& line, bool& spoke) {
         if (ParseFields(line.c_str() + 7, v)) g_cached.assign(v, v + 12);
         g_cached_ready = true;
         g_hcv.notify_all();
+    } else if (line.compare(0, 5, "wifi ") == 0) {
+        char* end = nullptr;
+        const auto request = std::strtoull(line.c_str() + 5, &end, 10);
+        if (end && *end == ' ' && line.size() < 128 * 1024) {
+            std::lock_guard<std::mutex> lk(g_hmu);
+            if (request == g_wifi_request) {
+                g_wifi.assign(end + 1); g_wifi_ready = true; g_hcv.notify_all();
+            }
+        }
     } else if (line.compare(0, 6, "error ") == 0) {
         // kCLErrorLocationUnknown (0) is transient; CoreLocation keeps trying.
         if (TraceOn() || line != "error 0")
@@ -439,6 +453,24 @@ jdoubleArray JNICALL NativeCachedFix(JNIEnv* env, jclass) {
     }
 }
 
+jstring JNICALL NativeWifiSnapshot(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> serial(g_wifi_mu);
+    uint64_t request;
+    {
+        std::lock_guard<std::mutex> lk(g_hmu);
+        request = ++g_wifi_request; g_wifi_ready = false; g_wifi.clear();
+    }
+    if (!HelperConfigured() || !HelperSend(("wifi " + std::to_string(request)).c_str())) return nullptr;
+    std::unique_lock<std::mutex> lk(g_hmu);
+    g_hcv.wait_for(lk, std::chrono::seconds(2), [] { return g_wifi_ready || g_hpid == 0; });
+    if (!g_wifi_ready) return nullptr;
+    NSString* json = [[NSString alloc] initWithBytes:g_wifi.data() length:g_wifi.size() encoding:NSUTF8StringEncoding];
+    if (!json) return nullptr;
+    std::vector<jchar> chars(json.length);
+    [json getCharacters:chars.data() range:NSMakeRange(0, json.length)];
+    return env->NewString(chars.data(), (jsize)chars.size());
+}
+
 void JNICALL NativeRequestAuth(JNIEnv*, jclass) {
     if (HelperConfigured() && HelperSend("auth")) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -511,6 +543,8 @@ const JNINativeMethod kMethods[] = {
      reinterpret_cast<void*>(&NativeServicesEnabled)},
     {const_cast<char*>("nativeCachedFix"), const_cast<char*>("()[D"),
      reinterpret_cast<void*>(&NativeCachedFix)},
+    {const_cast<char*>("nativeWifiSnapshot"), const_cast<char*>("()Ljava/lang/String;"),
+     reinterpret_cast<void*>(&NativeWifiSnapshot)},
     {const_cast<char*>("nativeRequestAuth"), const_cast<char*>("()V"),
      reinterpret_cast<void*>(&NativeRequestAuth)},
     {const_cast<char*>("nativeStart"), const_cast<char*>("(Z)V"),
