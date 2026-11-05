@@ -5147,7 +5147,7 @@ public class Activity extends ContextThemeWrapper
 
     /** AOSP startActivityFromChild(Activity, Intent, int): starts an activity
      *  on behalf of an embedded child, routing the result to the child. With no
-     *  ActivityGroup in this tree the child is always this activity.
+     *  embedded activity hosting in this tree the child is always this activity.
      *  @deprecated matches AOSP. */
     @Deprecated
     public void startActivityFromChild(Activity child, Intent intent, int requestCode) {

@@ -3883,15 +3883,8 @@ public final class ActivityHost {
             try { activity.invalidateOptionsMenu(); }
             catch (Throwable th) { NativeLog.w(TAG, "invalidateOptionsMenu: " + th); }
         }
-        // AOSP stops the covered activity only once the new top is up (the
-        // server defers StopActivityItem until the resumed activity reports
-        // idle -- ActivityTaskManagerService.activityIdle ->
-        // processStoppingAndFinishingActivities), so the whole launch burst
-        // runs first. onStop's contract is "no longer visible to the user ...
-        // because a new activity is being started on top", which our single
-        // shared window makes literally true the moment the new content view is
-        // installed.
-        stopForNewTop(outgoing);
+        // A translucent/floating top leaves the activity beneath it visible.
+        if (!WINDOW_ACTIVITY_ON || activity.macapkOwnsWindowBox()) stopForNewTop(outgoing);
     }
 
     /** Drive the activity a new top is covering down to PAUSED. Mirrors the
@@ -3935,26 +3928,8 @@ public final class ActivityHost {
      *  Only ever follows a pauseForNewTop (the sBackgrounded entry is the
      *  gate), and skips an activity that finished during the launch -- that one
      *  already went down through onActivityFinished. */
-    /** BISECT GATE (diagnostic, default OFF, remove once the question is settled).
-     *
-     *  AOSP does NOT stop every covered activity. ActivityTaskManager stops the
-     *  one below only when the new top is OPAQUE AND FULLSCREEN; below a
-     *  translucent or floating activity the one underneath stays VISIBLE, i.e.
-     *  STARTED, because the user can still see it. We stop unconditionally.
-     *
-     *  That matters beyond visibility, because an app's foreground/background
-     *  model is built from these callbacks. Instagram settles into
-     *  `BackgroundStartupDetector: bgMode=BACKGROUND reason=LAST_ACTIVITY_STOPPED`
-     *  immediately after we stop the activity its ModalActivity covered, then
-     *  goes quiet with an empty fragment host and ZERO sockets. Set
-     *  MACAPK_NO_STOP_COVERED=1 to skip the stop entirely and see whether the
-     *  app then builds its UI -- a one-run A/B that decides whether this is the
-     *  blocker before anyone writes the real opacity test.
-     *
-     *  This is NOT the fix. The fix is to decide from the INCOMING activity's
-     *  theme (windowIsTranslucent / windowIsFloating / a non-opaque
-     *  windowBackground), which our Manifest parser already carries as
-     *  `themeRaw` and ResourceIndex can resolve. */
+    /** Diagnostic bypass for opaque covers; normal launches use the incoming
+     *  activity's manifest window style, as the window policy already does. */
     private static final boolean NO_STOP_COVERED =
         System.getenv("MACAPK_NO_STOP_COVERED") != null;
 

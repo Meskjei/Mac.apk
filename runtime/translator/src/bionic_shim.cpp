@@ -64596,6 +64596,13 @@ extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
     int key = getKey ? guard.env->CallIntMethod(reinterpret_cast<jobject>(surface), getKey) : 0;
     if (cls) guard.env->DeleteLocalRef(cls);
     if (guard.env->ExceptionCheck()) return nullptr;
+    if (!texture && key > 0) {
+        // Prepublished engine windows can block AppKit during surfaceCreated; keep their existing path.
+        using PreparedLayer = void* (*)(int*, int*);
+        static auto prepared = reinterpret_cast<PreparedLayer>(dlsym(RTLD_DEFAULT, "CocoaGetUnityRenderLayer"));
+        int w = 0, h = 0;
+        if (prepared && prepared(&w, &h)) key = 0;
+    }
     if (texture || key > 0) {
         int w = 0, h = 0;
         void* layer = nullptr;
