@@ -23,6 +23,16 @@ public final class AutomationProtocolTest {
                 || AutomationServer.gestureStep(14, 28, 200, 450) != 14
                 || AutomationServer.gestureStep(1, 28, 900, 450) != 28)
             throw new AssertionError("gesture schedule accumulated or replayed expired moves");
+        if (!AutomationServer.isValidRecordingId("run_20261112-alpha")
+                || AutomationServer.isValidRecordingId("")
+                || AutomationServer.isValidRecordingId("../escape")
+                || AutomationServer.isValidRecordingId("a".repeat(101)))
+            throw new AssertionError("recordingId validation regression");
+        var recReq = AutomationServer.readRequest(new ByteArrayInputStream(
+                "{\"id\":\"req-1\",\"command\":\"recordingStart\",\"recordingId\":\"run_ok\",\"token\":\"t\"}\n"
+                    .getBytes(StandardCharsets.UTF_8)));
+        if (!recReq.getString("recordingId").equals("run_ok") || !recReq.getString("id").equals("req-1"))
+            throw new AssertionError("recordingId collided with request id");
         System.out.println("AutomationProtocolTest PASS");
     }
 }

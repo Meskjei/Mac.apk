@@ -47,6 +47,7 @@
 #include <cstring>         // std::strcmp / std::memcpy
 #include <map>             // window policy phase 3: remembered boxes by activity token
 #include "macapk/self_capture.h"
+#include "macapk/window_recording.h"
 #include "macapk/pending_layer_captures.h"
 #include "macapk/opaque_pixels.h"
 #include "macapk/webview_capture.h"
@@ -6254,8 +6255,15 @@ void CocoaMoveTaskToFront() {
 // FLAG_SECURE mirror entry (see "FLAG_SECURE -> NSWindow.sharingType" near the
 // top of this file). Any thread; the AppKit work runs on the main thread, and
 // the LATEST request wins when pushes race (the block re-reads the atomic).
+bool CocoaSecureContentActive() {
+    return g_secure_requested.load() != 0;
+}
+
 static void CocoaSetSecureContent(bool secure) {
     const int prev = g_secure_requested.exchange(secure ? 1 : 0);
+    if (secure) {
+        WindowRecordingNotifySecureContent();
+    }
     if (!MacapkSecureSharingEnabled()) {
         if (secure && prev == 0) {
             std::fprintf(stderr, "[window] FLAG_SECURE requested; "

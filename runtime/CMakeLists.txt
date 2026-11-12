@@ -177,6 +177,7 @@ set(MACAPK_RUNTIME_SOURCES
     src/media_video.mm
     src/video_toolbox.mm
     src/video_caps_probe.mm
+    src/window_recording.mm
     thirdparty/stb_vorbis.c
     src/cocoa_bridge.mm
     src/gles_bridge.cpp
@@ -216,6 +217,9 @@ set_source_files_properties(src/gamecontroller_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
 # location_bridge.mm: the CLLocationManager delegate and main-queue blocks.
 set_source_files_properties(src/location_bridge.mm PROPERTIES
+    COMPILE_OPTIONS "-fobjc-arc")
+# window_recording.mm: SCStream + AVAssetWriter blocks and retained pixel buffers.
+set_source_files_properties(src/window_recording.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
 if(ANGLE_HAVE)
     list(APPEND MACAPK_RUNTIME_SOURCES src/angle_glue.cpp)
@@ -417,6 +421,7 @@ target_link_libraries(macapk-runtime PRIVATE
     "-framework CoreLocation"
     "-framework MediaPlayer"
     "-framework IOKit"
+    "-weak_framework ScreenCaptureKit"
 )
 
 # libvpx: static archive, so this is an include-path + link-the-.a job only

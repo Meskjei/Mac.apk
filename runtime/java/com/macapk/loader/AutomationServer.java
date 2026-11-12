@@ -39,6 +39,57 @@ public final class AutomationServer {
     private final LinkedHashSet<String> seen = new LinkedHashSet<>();
     private String frameId, frameGeometry;
     private final long pid = ProcessHandle.current().pid();
+    private static final int MAX_RECORDING_ARCHIVES = 4;
+    private static final int MAX_RECORDING_CHUNK = 256 * 1024;
+
+    private static final class ActiveRecording {
+        final String id;
+        final Path path;
+        final long startedAt;
+        final int width, height;
+        ActiveRecording(String id, Path path, long startedAt, int width, int height) {
+            this.id = id; this.path = path; this.startedAt = startedAt; this.width = width; this.height = height;
+        }
+    }
+
+    private static final class ArchivedRecording {
+        final String id;
+        final Path path;
+        final long startedAt, finishedAt, size;
+        final int durationMs, width, height;
+        final String error;
+        ArchivedRecording(String id, Path path, long startedAt, long finishedAt, int durationMs,
+                          int width, int height, long size, String error) {
+            this.id = id; this.path = path; this.startedAt = startedAt; this.finishedAt = finishedAt;
+            this.durationMs = durationMs; this.width = width; this.height = height; this.size = size; this.error = error;
+        }
+        JSONObject toJson() throws org.json.JSONException {
+            JSONObject out = new JSONObject()
+                .put("startedAt", startedAt)
+                .put("finishedAt", finishedAt)
+                .put("durationMs", durationMs)
+                .put("width", width)
+                .put("height", height)
+                .put("size", size)
+                .put("source", "macapk-own-window-h264")
+                .put("mediaType", "video/mp4")
+                .put("clockUncertaintyMs", 50);
+            if (error != null && !error.isEmpty()) out.put("error", error);
+            return out;
+        }
+    }
+
+    private ActiveRecording activeRecording;
+    private final java.util.LinkedHashMap<String, ArchivedRecording> archivedRecordings = new java.util.LinkedHashMap<>();
+
+    static boolean isValidRecordingId(String id) {
+        return id != null && id.matches("[A-Za-z0-9_-]{1,100}");
+    }
+
+    private static boolean supportsRecording() {
+        try { return NativeCocoa.supportsWindowRecording(); }
+        catch (UnsatisfiedLinkError ignored) { return false; }
+    }
 
     private AutomationServer(String app, String credential, int port, Path directory) throws Exception {
         appId = app; token = credential; captures = directory;
@@ -123,10 +174,12 @@ public final class AutomationServer {
             if (active == null || active.isFinishing() || size[0] <= 0 || size[1] <= 0) throw new IllegalStateException("app_not_ready");
             viewportLocked = NativeCocoa.lockViewport() || viewportLocked;
             android.content.pm.PackageInfo packageInfo = active.getPackageManager().getPackageInfo(appId, 0);
+            JSONArray caps = new JSONArray(new String[]{"screenshot", "tree", "tap", "swipe", "longPress", "type", "clearText"});
+            if (supportsRecording()) caps.put("recording");
             return new JSONObject().put("protocol", 1).put("runtime", "macapk").put("appId", appId).put("pid", pid)
                 .put("appVersion", packageInfo.versionName).put("appBuild", String.valueOf(packageInfo.getLongVersionCode()))
                 .put("viewportFixed", NativeCocoa.viewportFixed()).put("width", size[0]).put("height", size[1]).put("foreground", !ActivityHost.peek().isFinishing())
-                .put("capabilities", new JSONArray(new String[]{"screenshot", "tree", "tap", "swipe", "longPress", "type", "clearText"}))
+                .put("capabilities", caps)
                 .put("fontEnvironment", new JSONObject().put("fontSetId", android.graphics.MacApkSystemFonts.fontSetId())
                     .put("nativeEmoji", android.graphics.MacApkSystemFonts.nativeEmojiConfigured() ? "configured" : "missing")
                     .put("javaEmojiRenderer", android.graphics.MacApkEmoji.available() ? "bitmap" : "host")
@@ -198,13 +251,163 @@ public final class AutomationServer {
         if (!Double.isFinite(n) || n < 0 || n >= 1) throw new IllegalArgumentException("invalid_coordinates");
         return n;
     }
+    private JSONObject recordingStart(JSONObject request) throws Exception {
+        String recId = request.optString("recordingId", "");
+        if (!isValidRecordingId(recId)) throw new IllegalArgumentException("invalid_recording_id");
+        if (!supportsRecording()) throw new IllegalStateException("recording_unsupported");
+        if (activeRecording != null && activeRecording.id.equals(recId)) {
+            return new JSONObject()
+                .put("startedAt", activeRecording.startedAt)
+                .put("width", activeRecording.width)
+                .put("height", activeRecording.height)
+                .put("source", "macapk-own-window-h264")
+                .put("mediaType", "video/mp4")
+                .put("clockUncertaintyMs", 50);
+        }
+        if (activeRecording != null) throw new IllegalStateException("recording_busy");
+        ArchivedRecording existing = archivedRecordings.get(recId);
+        if (existing != null) return existing.toJson();
+
+        long[] dims = ui(() -> {
+            viewportLocked = NativeCocoa.lockViewport() || viewportLocked;
+            if (!NativeCocoa.viewportFixed()) throw new IllegalStateException("device_viewport_changed_restart_session");
+            captureGeometry();
+            return TouchDispatcher.automationGeometry();
+        });
+        Path output = captures.resolve("macapk_recording_" + pid + "_" + recId + "_" + UUID.randomUUID() + ".mp4").normalize();
+        if (!captures.equals(output.getParent())) throw new IllegalArgumentException("invalid_recording_id");
+        JSONObject nativeRes = new JSONObject(NativeCocoa.startWindowRecording(recId, output.toString(), (int) dims[0], (int) dims[1]));
+        if (!nativeRes.optBoolean("ok", false)) {
+            Files.deleteIfExists(output);
+            throw new IllegalStateException(nativeRes.optString("error", "capture_unavailable"));
+        }
+        long startedAt = nativeRes.getLong("startedAt");
+        int width = nativeRes.getInt("width"), height = nativeRes.getInt("height");
+        activeRecording = new ActiveRecording(recId, output, startedAt, width, height);
+        return new JSONObject()
+            .put("startedAt", startedAt)
+            .put("width", width)
+            .put("height", height)
+            .put("source", "macapk-own-window-h264")
+            .put("mediaType", "video/mp4")
+            .put("clockUncertaintyMs", 50);
+    }
+
+    private JSONObject recordingStop(JSONObject request) throws Exception {
+        String recId = request.optString("recordingId", "");
+        if (!isValidRecordingId(recId)) throw new IllegalArgumentException("invalid_recording_id");
+        ArchivedRecording done = archivedRecordings.get(recId);
+        if (done != null) return done.toJson();
+        if (activeRecording == null || !activeRecording.id.equals(recId)) throw new IllegalStateException("recording_not_found");
+
+        ActiveRecording current = activeRecording;
+        activeRecording = null;
+        String javaOverlaySecure = ui(() -> {
+            try { captureGeometry(); return null; }
+            catch (IllegalStateException e) {
+                String m = e.getMessage();
+                return (m != null && m.startsWith("capture_secure")) ? "capture_secure_window" : null;
+            }
+        });
+        JSONObject nativeRes = new JSONObject(NativeCocoa.stopWindowRecording(recId));
+        if (!nativeRes.optBoolean("ok", false)) {
+            Files.deleteIfExists(current.path);
+            throw new IllegalStateException(nativeRes.optString("error", "recording_empty"));
+        }
+        if (!Files.isRegularFile(current.path, LinkOption.NOFOLLOW_LINKS)) {
+            Files.deleteIfExists(current.path);
+            throw new IllegalStateException("recording_empty");
+        }
+        long realSize = Files.size(current.path);
+        if (realSize <= 0) {
+            Files.deleteIfExists(current.path);
+            throw new IllegalStateException("recording_empty");
+        }
+        String partialError = nativeRes.optString("error", "");
+        if (partialError.isEmpty() && javaOverlaySecure != null) partialError = javaOverlaySecure;
+        ArchivedRecording entry = new ArchivedRecording(
+            recId,
+            current.path,
+            nativeRes.optLong("startedAt", current.startedAt),
+            nativeRes.optLong("finishedAt", System.currentTimeMillis()),
+            Math.max(1, nativeRes.optInt("durationMs", 1)),
+            nativeRes.optInt("width", current.width),
+            nativeRes.optInt("height", current.height),
+            realSize,
+            partialError.isEmpty() ? null : partialError
+        );
+        archivedRecordings.remove(recId);
+        archivedRecordings.put(recId, entry);
+        while (archivedRecordings.size() > MAX_RECORDING_ARCHIVES) {
+            var it = archivedRecordings.entrySet().iterator();
+            if (!it.hasNext()) break;
+            ArchivedRecording evicted = it.next().getValue();
+            it.remove();
+            Files.deleteIfExists(evicted.path);
+        }
+        return entry.toJson();
+    }
+
+    private JSONObject recordingRead(JSONObject request) throws Exception {
+        String recId = request.optString("recordingId", "");
+        if (!isValidRecordingId(recId)) throw new IllegalArgumentException("invalid_recording_id");
+        if (activeRecording != null && activeRecording.id.equals(recId)) throw new IllegalStateException("recording_not_stopped");
+        ArchivedRecording entry = archivedRecordings.get(recId);
+        if (entry == null) throw new IllegalStateException("recording_not_found");
+        if (!request.has("offset")) throw new IllegalArgumentException("invalid_recording_offset");
+        double rawOffset = request.getDouble("offset");
+        long offset = request.getLong("offset");
+        if (!Double.isFinite(rawOffset) || rawOffset != (double) offset || offset < 0 || offset >= entry.size) {
+            throw new IllegalArgumentException("invalid_recording_offset");
+        }
+        int length = (int) Math.min(MAX_RECORDING_CHUNK, entry.size - offset);
+        ByteBuffer buf = ByteBuffer.allocate(length);
+        try (var channel = Files.newByteChannel(entry.path, LinkOption.NOFOLLOW_LINKS, StandardOpenOption.READ)) {
+            channel.position(offset);
+            while (buf.hasRemaining()) {
+                int n = channel.read(buf);
+                if (n <= 0) break;
+            }
+        }
+        int readBytes = buf.position();
+        if (readBytes <= 0) throw new IllegalStateException("invalid_recording_offset");
+        byte[] slice = buf.hasArray() && readBytes == length ? buf.array() : java.util.Arrays.copyOf(buf.array(), readBytes);
+        return entry.toJson()
+            .put("chunk", Base64.getEncoder().encodeToString(slice))
+            .put("done", (offset + readBytes) >= entry.size);
+    }
+
+    private JSONObject recordingRelease(JSONObject request) throws Exception {
+        String recId = request.optString("recordingId", "");
+        if (!isValidRecordingId(recId)) throw new IllegalArgumentException("invalid_recording_id");
+        if (activeRecording != null && activeRecording.id.equals(recId)) throw new IllegalStateException("recording_not_stopped");
+        ArchivedRecording entry = archivedRecordings.remove(recId);
+        if (entry == null) throw new IllegalStateException("recording_not_found");
+        Files.deleteIfExists(entry.path);
+        return new JSONObject().put("released", true);
+    }
+
     private JSONObject execute(JSONObject request) throws Exception {
         String command = request.getString("command");
         if (command.equals("info")) return info();
         if (command.equals("screenshot")) return screenshot();
         if (command.equals("tree")) return tree();
+        if (command.equals("recordingStart")) return recordingStart(request);
+        if (command.equals("recordingStop")) return recordingStop(request);
+        if (command.equals("recordingRead")) return recordingRead(request);
+        if (command.equals("recordingRelease")) return recordingRelease(request);
         if (command.equals("quit")) {
             if (!"1".equals(System.getenv("MACAPK_AUTOMATION_OWNED"))) throw new IllegalStateException("process_not_owned");
+            if (activeRecording != null) {
+                ActiveRecording cur = activeRecording;
+                activeRecording = null;
+                try { NativeCocoa.stopWindowRecording(cur.id); } catch (Throwable ignored) {}
+                Files.deleteIfExists(cur.path);
+            }
+            for (ArchivedRecording entry : archivedRecordings.values()) {
+                try { Files.deleteIfExists(entry.path); } catch (Throwable ignored) {}
+            }
+            archivedRecordings.clear();
             new Thread(() -> { try { Thread.sleep(150); ActivityHost.macapkTerminate(3000, true); } catch (Throwable ignored) {} System.exit(0); }, "automation quit").start();
             return new JSONObject().put("quitting", true);
         }

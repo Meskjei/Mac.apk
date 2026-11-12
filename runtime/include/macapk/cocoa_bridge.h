@@ -58,6 +58,7 @@ void CocoaRestoreUserOrientation();
 // drive cadence, and android.view.Display.getRefreshRate(); they must not diverge (v1.0.568).
 bool CocoaLockViewport();    // freeze the ready automation canvas, only with MACAPK_FIXED_VIEWPORT=1
 bool CocoaViewportFixed();   // false if geometry or backing scale changed after locking
+bool CocoaSecureContentActive(); // true while Java FLAG_SECURE mirror is active
 float CocoaBackingScale();   // real window backing scale; input mapping used a hardcoded 2.0f
 // The process's display density (v1.0.2187): the launch screen's backing scale in
 // dpi -- 320 on Retina, 160 on a 1x monitor -- or MACAPK_DISPLAY_DENSITY. Decided

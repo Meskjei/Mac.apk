@@ -88,6 +88,13 @@ public final class NativeCocoa {
      *  UnsatisfiedLinkError. Gate MACAPK_SECURE_WINDOW_SHARING (native). */
     public static native void setSecureContent(boolean secure);
 
+    /** Own-window H.264 MP4 recording for Touchstone mac-app automation (macOS 14.4+).
+     *  Soft-registered in window_recording.mm so runtime/jar version skew never aborts boot. */
+    public static native boolean supportsWindowRecording();
+    public static native String startWindowRecording(String recordingId, String outputPath,
+                                                     int targetWidthPx, int targetHeightPx);
+    public static native String stopWindowRecording(String recordingId);
+
     /** Window policy phase 3 (ActivityHost "every activity gets its own box";
      *  winpolicy::ApplyActivityTransition). An activity STARTS (event 0; 1 =
      *  as the first activity of a NEW task) or is REVEALED as the box owner

@@ -4461,6 +4461,7 @@ namespace photos { void RegisterPhotosBridgeMethods(JNIEnv* env); }
 // (gate MACAPK_SECURE_WINDOW_SHARING). Soft-fails, so it is NOT a row in
 // kNativeCocoaMethods: Bind() would abort boot on a jar that lacks the decl.
 namespace cocoasecure { void RegisterSecureContentMethods(JNIEnv* env); }
+namespace windowrecording { void RegisterWindowRecordingMethods(JNIEnv* env); }
 #ifdef MACAPK_HAS_ANGLE
 // Defined in angle_glue.cpp; registers javax.microedition.khronos.egl.MacApkEGL10's
 // nativeCreateSurfaceViewWindow: the window surface a SurfaceView GL thread that
@@ -4555,6 +4556,7 @@ void RegisterAllNativeMethods(JNIEnv* env) {
     wallpaper::RegisterWallpaperBridgeMethods(env);
     photos::RegisterPhotosBridgeMethods(env);
     cocoasecure::RegisterSecureContentMethods(env);
+    windowrecording::RegisterWindowRecordingMethods(env);
     RegisterDocumentPickerMethods(env);
 #ifdef MACAPK_HAS_ANGLE
     RegisterAngleGlueNatives(env);
